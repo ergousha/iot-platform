@@ -94,7 +94,7 @@ sequenceDiagram
 
 ## 3. Firmware Release & OTA Flow
 
-The platform provides automatic, event-driven rolling OTA updates triggered when a new firmware binary is uploaded to Amazon S3.
+The platform provides automatic, event-driven rolling OTA updates triggered when a new firmware binary is uploaded to Amazon S3. Each upload becomes one AWS IoT Job for the **fleet thing group**, rolled out in stages and stopped automatically when too many devices fail.
 
 ### OTA Sequence Diagram
 
@@ -106,7 +106,7 @@ sequenceDiagram
     participant OIDC as AWS IAM (OIDC)
     participant S3 as Amazon S3
     participant Lambda as AWS Lambda (ota_trigger)
-    participant IoT as AWS IoT Core
+    participant IoT as AWS IoT Core (Jobs)
     participant Device as ESP32 Device (Rust)
 
     Developer->>GitHub: Push tagged commit / Merge PR to main
@@ -115,14 +115,14 @@ sequenceDiagram
     OIDC-->>GitHub: Temporary AWS credentials
     GitHub->>S3: Upload firmware.bin (key: firmware_vX.Y.Z.bin)
     S3->>Lambda: Trigger s3:ObjectCreated notification
-    Lambda->>S3: Generate 24-hour pre-signed GET URL
-    S3-->>Lambda: Pre-signed URL
-    Lambda->>IoT: Query active target devices (list_things)
-    Lambda->>IoT: Create AWS IoT Job (JobDoc: pre-signed URL & version)
+    Lambda->>IoT: Create CONTINUOUS job for the fleet thing group<br/>(rollout, abort, timeout & presigned-URL config)
+    Lambda->>IoT: Cancel the group's older ota-* jobs
+    Note over IoT: Notify devices at the rollout rate,<br/>faster as executions succeed
     IoT-->>Device: Notify via $aws/things/{thingName}/jobs/notify-next
     Device->>IoT: Request job details via $aws/things/{thingName}/jobs/$next/get
+    Note over IoT: Replace the download_url placeholder with a<br/>1-hour pre-signed GET URL (ota-presign role)
     IoT-->>Device: Return job document containing pre-signed URL & version
-    Note over Device: Compare version & mark Job IN_PROGRESS
+    Note over Device: Mark Job IN_PROGRESS (in-progress timeout starts)
     Device->>S3: Perform HTTP GET on pre-signed URL
     S3-->>Device: Stream binary payload
     Note over Device: Write binary block-by-block to inactive OTA partition
@@ -133,6 +133,45 @@ sequenceDiagram
     IoT-->>Device: Connection successful
     Note over Device: Run verification checklist & call<br/>esp_ota_mark_app_valid_cancel_rollback()
 ```
+
+The firmware currently reports SUCCEEDED right after the download, before it reboots. [esp32-opcua-gateway-rust#14](https://github.com/ergousha/esp32-opcua-gateway-rust/issues/14) moves that report to the new image, after it has marked itself valid, and reports a rollback as FAILED. From then on, the abort and timeout settings below count real outcomes.
+
+### Thing Groups
+
+| Group | Members | Purpose |
+| :--- | :--- | :--- |
+| `esp32-ztp-fleet` | Every device the provisioning template registers | Target of every OTA job |
+| `esp32-ztp-canary` | The things in `ota_canary_things` (default: the bench unit `28848553144F`) | Child of the fleet group, so it receives every fleet job too. Marks the devices a canary-first rollout would update first |
+
+AWS IoT allows a thing in only one group of a hierarchy. A device provisioned since the fleet group existed is already in it, so to make it a canary, remove it from the fleet group first, then add it to `ota_canary_things` and apply:
+```sh
+aws iot update-thing-groups-for-thing --thing-name <thing> --thing-groups-to-remove esp32-ztp-fleet
+```
+If a device provisions again, the template leaves its group membership as it is.
+
+### Job Configuration
+
+| Setting | Terraform variable | Default |
+| :--- | :--- | :--- |
+| Rollout starts at | `ota_rollout_base_rate_per_minute` | 1 device per minute |
+| ... and is multiplied by | `ota_rollout_increment_factor` | 2 |
+| ... each time this many more devices succeed | `ota_rollout_succeeded_things` | 5 |
+| ... up to | `ota_rollout_max_per_minute` | 20 devices per minute |
+| Cancel the job when this share of executions ended FAILED, TIMED_OUT or REJECTED | `ota_abort_failure_percentage` | 20 % |
+| ... counted once this many devices have been notified | `ota_abort_min_executed_things` | 10 |
+| An execution still IN_PROGRESS after this becomes TIMED_OUT | `ota_in_progress_timeout_minutes` | 30 minutes |
+
+Terraform validates these against the ranges the AWS IoT API accepts, and passes them to the Lambda as environment variables. The Lambda checks them again and refuses to start if any is missing or invalid, rather than create a job without its brakes. `aws iot describe-job --job-id <id>` shows the configuration of a created job.
+
+### One Release in Flight
+
+The job is **CONTINUOUS**, so a device that joins the fleet group later still receives it. A continuous job never completes, though, and a device that joined would receive every older release still active, oldest first. So after creating its job, the Lambda cancels the group's older `ota-*` jobs. It does not force the cancellation: queued executions are dropped, while a device already mid-update finishes and then takes the new job.
+
+The job ID is `ota-<version>-<upload time in ms>`, taken from the S3 event rather than the clock. A redelivered or retried event therefore maps to the job it already created, and "older" means an earlier upload even when invocations run out of order. A failed invocation returns an error, so Lambda retries it; the retry finds the job and finishes the cancellation. Uploading the same file again is a new upload: it creates a new job, which the whole group receives again.
+
+### Download URLs
+
+The job document keeps its fields (`operation`, `firmware_version`, `download_url`), but `download_url` holds an AWS IoT placeholder. Each time a device requests the document, AWS IoT replaces it with a pre-signed GET URL valid for an hour, signed as the `esp32-ztp-ota-presign-role`. A device that joins months after the upload, or is reached late in a slow rollout, never gets an expired URL.
 
 ---
 

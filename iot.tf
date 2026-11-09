@@ -123,7 +123,40 @@ resource "aws_iot_policy" "device" {
 }
 
 # ---------------------------------------------------------------------------
-# 3) Fleet Provisioning Template.
+# 3) OTA thing groups.
+#    Every OTA job targets the FLEET group. CANARY is its child, so canary
+#    devices are part of every fleet job too; it marks the bench units a
+#    canary-first rollout would update first. AWS IoT allows a thing in only
+#    one group of a hierarchy, which keeps the two sets disjoint.
+#    New devices join the fleet group through the provisioning template below;
+#    canary devices are listed in var.ota_canary_things.
+# ---------------------------------------------------------------------------
+resource "aws_iot_thing_group" "fleet" {
+  name = "${var.project_name}-fleet"
+
+  properties {
+    description = "All provisioned gateways. OTA jobs target this group."
+  }
+}
+
+resource "aws_iot_thing_group" "canary" {
+  name              = "${var.project_name}-canary"
+  parent_group_name = aws_iot_thing_group.fleet.name
+
+  properties {
+    description = "Bench and test gateways. A child of the fleet group, so they receive every fleet OTA job."
+  }
+}
+
+resource "aws_iot_thing_group_membership" "canary" {
+  for_each = toset(var.ota_canary_things)
+
+  thing_name       = each.value
+  thing_group_name = aws_iot_thing_group.canary.name
+}
+
+# ---------------------------------------------------------------------------
+# 4) Fleet Provisioning Template.
 #    Defines which thing/cert/policy will be created in the RegisterThing call.
 #    pre_provisioning_hook: Lambda validation is required on each request.
 # ---------------------------------------------------------------------------
@@ -170,10 +203,16 @@ resource "aws_iot_provisioning_template" "fleet" {
           AttributePayload = {
             mac = { Ref = "MacAddress" }
           }
+          # New devices join the fleet group, so they get the OTA job in flight.
+          ThingGroups = [aws_iot_thing_group.fleet.name]
         }
         OverrideSettings = {
           AttributePayload = "MERGE"
           ThingTypeName    = "REPLACE"
+          # A device that provisions again keeps the groups it has: MERGE would
+          # fail for a canary device (fleet is in the same hierarchy), and
+          # REPLACE would silently drop it out of canary.
+          ThingGroups = "DO_NOTHING"
         }
       }
     }
@@ -187,7 +226,7 @@ resource "aws_iot_provisioning_template" "fleet" {
 }
 
 # ---------------------------------------------------------------------------
-# 4) (Optional) Simple IoT Rule to route telemetry to CloudWatch Logs.
+# 5) (Optional) Simple IoT Rule to route telemetry to CloudWatch Logs.
 #    Useful to see that the device actually publishes in PoC.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "telemetry" {
@@ -239,7 +278,7 @@ resource "aws_iot_topic_rule" "telemetry_to_logs" {
 }
 
 # ---------------------------------------------------------------------------
-# 5) OPC UA gateway telemetry.
+# 6) OPC UA gateway telemetry.
 #    The OPC UA driver publishes BATCHES on `<prefix>/<thing>/opcua`, which the
 #    `<prefix>/+/data` rule above does not match. A separate log group keeps the
 #    batched OPC UA payloads out of the plain-telemetry stream, which is what
