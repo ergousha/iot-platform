@@ -87,6 +87,11 @@ variable "products" {
       github_repository    = "ergousha/esp32-display-vaktus-salat-rust"
       github_repository_id = 1290322529
       require_public_key   = true
+      # The bench unit (ATECC608B 0123C471D3B627CFEE). Before applying, move it
+      # out of the fleet group (a thing can be in one group of a hierarchy):
+      # aws iot update-thing-groups-for-thing --thing-name 38182B8456F4 \
+      #   --thing-groups-to-remove esp32-ztp-vaktus-fleet
+      canary_things = ["38182B8456F4"]
     }
   }
 
