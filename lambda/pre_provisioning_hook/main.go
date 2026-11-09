@@ -115,6 +115,18 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		return reject, nil
 	}
 
+	// The template names the thing after SerialNumber, and the device policy
+	// lets a connection act as exactly that thing. Every product names its
+	// thing after its MAC, so require that: otherwise a registered device
+	// could enrol under another device's thing name, another product's
+	// included, and receive its jobs and shadow.
+	thingName := thingNameForMAC(mac)
+	if serial != thingName {
+		slog.Warn("REJECTED: SerialNumber is not the thing name of this MAC",
+			"mac", mac, "serial", serial, "expected", thingName)
+		return reject, nil
+	}
+
 	resp, err := a.dbClient.GetItem(ctx, &dynamodb.GetItemInput{
 		TableName: aws.String(a.tableName),
 		Key: map[string]types.AttributeValue{
@@ -189,10 +201,6 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 	}
 
 	// Record the provisioning (best-effort)
-	serialOrMac := serial
-	if serialOrMac == "" {
-		serialOrMac = mac
-	}
 
 	_, err = a.dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(a.tableName),
@@ -202,7 +210,7 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		UpdateExpression: aws.String("SET provisioned = :t, last_provisioned_serial = :s, last_certificate_id = :c, last_provisioned_via = :m"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
 			":t": &types.AttributeValueMemberBOOL{Value: true},
-			":s": &types.AttributeValueMemberS{Value: serialOrMac},
+			":s": &types.AttributeValueMemberS{Value: thingName},
 			":c": &types.AttributeValueMemberS{Value: event.CertificateID},
 			":m": &types.AttributeValueMemberS{Value: method},
 		},
@@ -215,9 +223,16 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 	return PreProvisioningResponse{
 		AllowProvisioning: true,
 		ParameterOverrides: map[string]string{
-			"MacAddress": mac,
+			"MacAddress":   mac,
+			"SerialNumber": thingName,
 		},
 	}, nil
+}
+
+// thingNameForMAC is the thing name every product uses: the MAC as 12
+// uppercase hex digits, without separators.
+func thingNameForMAC(mac string) string {
+	return strings.ToUpper(strings.NewReplacer(":", "", "-", "").Replace(mac))
 }
 
 // templateNameFromARN returns <name> from arn:aws:iot:...:provisioningtemplate/<name>.
