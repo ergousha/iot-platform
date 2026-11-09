@@ -170,12 +170,12 @@ func TestHandler(t *testing.T) {
 		},
 		{
 			name:        "Gateway - secret missing",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC}},
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "SerialNumber": "38182B8456F4"}},
 			getItemFunc: record(legacyGateway),
 		},
 		{
 			name:        "Gateway - secret mismatch",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "wrongsecret"}},
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "wrongsecret", "SerialNumber": "38182B8456F4"}},
 			getItemFunc: record(legacyGateway),
 		},
 		{
@@ -184,6 +184,23 @@ func TestHandler(t *testing.T) {
 			getItemFunc: record(map[string]types.AttributeValue{
 				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "public_key": s(device.rawXY()),
 			}),
+		},
+
+		// --- The thing name is the MAC ---
+		{
+			name:        "Rejected - SerialNumber names another thing (a gateway's)",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: map[string]string{"MacAddress": testMAC, "SerialNumber": "28848553144F"}},
+			getItemFunc: record(vaktusRecord(device.rawXY())),
+		},
+		{
+			name:        "Rejected - SerialNumber missing",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "supersecret"}},
+			getItemFunc: record(legacyGateway),
+		},
+		{
+			name:        "Gateway - lowercase SerialNumber is not the thing name",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182b8456f4"}},
+			getItemFunc: record(legacyGateway),
 		},
 
 		// --- Common checks ---
@@ -334,8 +351,8 @@ func TestHandler(t *testing.T) {
 				return
 			}
 
-			if resp.ParameterOverrides["MacAddress"] != testMAC {
-				t.Errorf("expected MacAddress override %s, got %v", testMAC, resp.ParameterOverrides)
+			if resp.ParameterOverrides["MacAddress"] != testMAC || resp.ParameterOverrides["SerialNumber"] != "38182B8456F4" {
+				t.Errorf("expected MacAddress %s and SerialNumber 38182B8456F4 overrides, got %v", testMAC, resp.ParameterOverrides)
 			}
 			if len(mockClient.updateItemCalls) != 1 {
 				t.Fatalf("expected 1 UpdateItem call, got %d", len(mockClient.updateItemCalls))
@@ -368,7 +385,7 @@ func TestRecordWithoutProductAndNoLegacyProduct(t *testing.T) {
 	app := &App{dbClient: mockClient, tableName: tableName, templates: testTemplates()}
 	resp, err := app.Handler(context.Background(), PreProvisioningEvent{
 		TemplateARN: templateARNPrefix + gatewayTemplate,
-		Parameters:  map[string]string{"MacAddress": testMAC, "Secret": "supersecret"},
+		Parameters:  map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182B8456F4"},
 	})
 	if err != nil || resp.AllowProvisioning {
 		t.Errorf("expected a rejection, got %+v, %v", resp, err)
@@ -400,6 +417,18 @@ func TestLoadTemplates(t *testing.T) {
 	for _, bad := range []string{"", "not json", "{}", `{"t":{}}`, `{"":{"product":"x"}}`} {
 		if _, err := loadTemplates(bad); err == nil {
 			t.Errorf("expected an error for %q", bad)
+		}
+	}
+}
+
+func TestThingNameForMAC(t *testing.T) {
+	for in, want := range map[string]string{
+		"38:18:2B:84:56:F4": "38182B8456F4",
+		"28:84:85:53:14:4f": "28848553144F",
+		"AA-BB-CC-DD-EE-FF": "AABBCCDDEEFF",
+	} {
+		if got := thingNameForMAC(in); got != want {
+			t.Errorf("thingNameForMAC(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
