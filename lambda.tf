@@ -33,25 +33,45 @@ resource "aws_lambda_function" "pre_provisioning_hook" {
   filename         = data.archive_file.hook_zip.output_path
   source_code_hash = data.archive_file.hook_zip.output_base64sha256
 
-  memory_size = 128 # minimum; maliyet-etkin
-  timeout     = 5   # IoT hook zaten ~5sn bekler
+  memory_size = 128 # the minimum; the hook does one GetItem and one UpdateItem
+  timeout     = 5   # AWS IoT waits about 5 s for the hook anyway
 
   environment {
     variables = {
       DEVICE_TABLE = aws_dynamodb_table.device_registry.name
+      # Which product each template enrols, and whether that product must prove
+      # itself with a registered public key. See lambda/pre_provisioning_hook.
+      PRODUCTS_BY_TEMPLATE = jsonencode({
+        for id, p in local.products : p.provisioning_template_name => {
+          product            = id
+          require_public_key = p.require_public_key
+        }
+      })
+      # Registry records written before products existed carry no `product`
+      # attribute; they belong to the legacy product ("" = none: rejected).
+      LEGACY_RECORD_PRODUCT = local.legacy_product == null ? "" : local.legacy_product
     }
   }
 
   depends_on = [aws_cloudwatch_log_group.hook]
 }
 
-# IoT Core'un bu Lambda'yi cagirmasina izin ver.
-# source_arn'i locals'tan (string) veriyoruz; template resource'una referans
-# vermek dongu yaratirdi. Boylece izin, template'ten once olusur.
+# Lets AWS IoT invoke the hook, once per provisioning template. source_arn
+# comes from a string local rather than the template resources: referencing
+# them would be a cycle, and this way the permission exists before the
+# template that needs it. The legacy product keeps the statement id it had
+# before products existed, so its permission is updated in place, never removed.
 resource "aws_lambda_permission" "allow_iot" {
-  statement_id  = "AllowIoTFleetProvisioningInvoke"
+  for_each = local.products
+
+  statement_id  = each.value.legacy ? "AllowIoTFleetProvisioningInvoke" : "AllowIoTFleetProvisioningInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.pre_provisioning_hook.function_name
   principal     = "iot.amazonaws.com"
-  source_arn    = local.provisioning_template_arn
+  source_arn    = local.provisioning_template_arns[each.key]
+}
+
+moved {
+  from = aws_lambda_permission.allow_iot
+  to   = aws_lambda_permission.allow_iot["gateway"]
 }

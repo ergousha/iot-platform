@@ -10,12 +10,6 @@ variable "project_name" {
   default     = "esp32-ztp"
 }
 
-variable "provisioning_template_name" {
-  description = "Fleet Provisioning template name. Must match the firmware."
-  type        = string
-  default     = "esp32-s3-fleet-template"
-}
-
 variable "log_retention_days" {
   description = "CloudWatch log retention period (kept low for cost reasons)."
   type        = number
@@ -28,39 +22,101 @@ variable "telemetry_topic_prefix" {
   default     = "dt"
 }
 
-variable "github_repositories" {
-  description = "Allowed GitHub repositories with their numeric IDs"
-  type = list(object({
-    name          = string
-    repository_id = number
+variable "products" {
+  description = <<-EOT
+    Every device product on the platform, keyed by a short product id. The id
+    is the firmware bucket prefix (s3://<bucket>/<id>/firmware_vX.Y.Z.bin), part
+    of every OTA job id, and the `product` attribute a registry record and a
+    provisioned thing carry.
+
+    Each product gets its own fleet thing group (target of its OTA jobs), canary
+    group, provisioning template, SSM template parameter and GitHub Actions
+    role, so releases of one product can never reach another.
+
+    The *_name fields default to "<project_name>-<id>-..." names; the gateway
+    pins the names it had before products existed, so no live resource is
+    renamed (a rename would recreate it).
+  EOT
+  type = map(object({
+    description = string
+
+    # GitHub repository whose main branch may publish this product's firmware.
+    github_repository    = string
+    github_repository_id = number
+
+    # Things placed in the canary group. A thing can only be in one group of a
+    # hierarchy and new devices start in the fleet group, so move a device out
+    # of it first (aws iot update-thing-groups-for-thing --thing-name <thing>
+    # --thing-groups-to-remove <fleet group>). A thing must exist before it can
+    # be listed here.
+    canary_things = optional(list(string), [])
+
+    # true: the device keeps its private key in a secure element and enrols with
+    # a CSR. The pre-provisioning hook then requires the registry record's
+    # public_key to match the key in the new certificate; the shared secret is
+    # not accepted for this product.
+    require_public_key = optional(bool, false)
+
+    # This product owned the platform before products existed. Firmware at the
+    # bucket root (firmware_vX.Y.Z.bin, where its releases used to go) and
+    # registry records without a `product` attribute belong to it. At most one
+    # product may set it.
+    legacy = optional(bool, false)
+
+    fleet_group_name           = optional(string)
+    canary_group_name          = optional(string)
+    provisioning_template_name = optional(string)
+    github_actions_role_name   = optional(string)
   }))
-  default = [
-    {
-      name          = "ergousha/esp32-opcua-gateway-rust"
-      repository_id = 1302001123
-    },
-    {
-      name          = "ergousha/esp32-display-vaktus-salat-rust"
-      repository_id = 1290322529
+
+  default = {
+    gateway = {
+      description          = "OPC UA gateway (Waveshare ESP32-S3-ETH)"
+      github_repository    = "ergousha/esp32-opcua-gateway-rust"
+      github_repository_id = 1302001123
+      canary_things        = ["28848553144F"]
+      legacy               = true
+
+      fleet_group_name           = "esp32-ztp-fleet"
+      canary_group_name          = "esp32-ztp-canary"
+      provisioning_template_name = "esp32-s3-fleet-template"
+      github_actions_role_name   = "esp32-ztp-github-actions-role"
     }
-  ]
+    vaktus = {
+      description          = "Vaktu's-Salat prayer-times display (ESP32 + ATECC608B)"
+      github_repository    = "ergousha/esp32-display-vaktus-salat-rust"
+      github_repository_id = 1290322529
+      require_public_key   = true
+    }
+  }
+
+  validation {
+    condition     = alltrue([for id in keys(var.products) : can(regex("^[a-z][a-z0-9]{1,15}$", id))])
+    error_message = "Product ids are 2-16 lowercase letters and digits, starting with a letter (they appear in S3 keys, job ids and resource names)."
+  }
+
+  validation {
+    condition = alltrue(flatten([
+      for p in values(var.products) : [for t in p.canary_things : can(regex("^[a-zA-Z0-9:_-]{1,128}$", t))]
+    ]))
+    error_message = "Canary thing names are 1-128 characters of letters, digits, ':', '_' and '-'."
+  }
+
+  validation {
+    condition     = length([for p in values(var.products) : p if p.legacy]) <= 1
+    error_message = "At most one product may set legacy."
+  }
+
+  validation {
+    condition     = length(distinct([for p in values(var.products) : p.github_repository])) == length(var.products)
+    error_message = "Each product needs its own GitHub repository (the repository is what its CI role trusts)."
+  }
 }
 
 variable "github_owner_id" {
   description = "Permanent numeric ID of the GitHub repository owner."
   type        = number
   default     = 2912014
-}
-
-variable "ota_canary_things" {
-  description = "Things placed in the canary thing group. AWS IoT allows a thing in only one group of a hierarchy, and devices provisioned after the fleet group existed start in it, so move such a device out of the fleet group before listing it here (aws iot update-thing-groups-for-thing --thing-name <thing> --thing-groups-to-remove <fleet group>)."
-  type        = list(string)
-  default     = ["28848553144F"]
-
-  validation {
-    condition     = alltrue([for t in var.ota_canary_things : can(regex("^[a-zA-Z0-9:_-]{1,128}$", t))])
-    error_message = "Thing names are 1-128 characters of letters, digits, ':', '_' and '-'."
-  }
 }
 
 # ---------------------------------------------------------------------------

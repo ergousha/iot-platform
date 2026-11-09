@@ -2,6 +2,17 @@
 # AWS IoT Core - Fleet Provisioning by Claim
 # ===========================================================================
 
+locals {
+  # Both certificate APIs: CreateKeysAndCertificate (AWS generates the key; the
+  # gateway) and CreateCertificateFromCsr (the key stays in the device's secure
+  # element; Vaktus). Which one a product may effectively use is enforced by the
+  # pre-provisioning hook, not here: the claim certificate is shared.
+  claim_topics = concat(
+    ["$aws/certificates/create/*", "$aws/certificates/create-from-csr/*"],
+    [for p in values(local.products) : "$aws/provisioning-templates/${p.provisioning_template_name}/provision/*"],
+  )
+}
+
 # ---------------------------------------------------------------------------
 # 1) CLAIM (bootstrap) certificate.
 #    COMMON certificate carried by all devices leaving the factory.
@@ -25,22 +36,16 @@ resource "aws_iot_policy" "claim" {
         Resource = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/*"
       },
       {
-        Sid    = "CreateKeysAndCertificate"
-        Effect = "Allow"
-        Action = ["iot:Publish", "iot:Receive"]
-        Resource = [
-          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/certificates/create/*",
-          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topic/$aws/provisioning-templates/${var.provisioning_template_name}/provision/*",
-        ]
+        Sid      = "CreateKeysAndCertificate"
+        Effect   = "Allow"
+        Action   = ["iot:Publish", "iot:Receive"]
+        Resource = [for t in local.claim_topics : "${local.iot_arn}:topic/${t}"]
       },
       {
-        Sid    = "SubscribeProvisioningResponses"
-        Effect = "Allow"
-        Action = "iot:Subscribe"
-        Resource = [
-          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topicfilter/$aws/certificates/create/*",
-          "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:topicfilter/$aws/provisioning-templates/${var.provisioning_template_name}/provision/*",
-        ]
+        Sid      = "SubscribeProvisioningResponses"
+        Effect   = "Allow"
+        Action   = "iot:Subscribe"
+        Resource = [for t in local.claim_topics : "${local.iot_arn}:topicfilter/${t}"]
       },
     ]
   })
@@ -123,46 +128,60 @@ resource "aws_iot_policy" "device" {
 }
 
 # ---------------------------------------------------------------------------
-# 3) OTA thing groups.
-#    Every OTA job targets the FLEET group. CANARY is its child, so canary
-#    devices are part of every fleet job too; it marks the bench units a
-#    canary-first rollout would update first. AWS IoT allows a thing in only
-#    one group of a hierarchy, which keeps the two sets disjoint.
-#    New devices join the fleet group through the provisioning template below;
-#    canary devices are listed in var.ota_canary_things.
+# 3) OTA thing groups, one pair per product.
+#    Every OTA job of a product targets its FLEET group. CANARY is a child of
+#    it, so canary devices are part of every fleet job too; it marks the bench
+#    units a canary-first rollout would update first. AWS IoT allows a thing in
+#    only one group of a hierarchy, which keeps the two sets disjoint. The
+#    products' hierarchies are separate, so a job never crosses products.
+#    New devices join their product's fleet group through its provisioning
+#    template below; canary devices are listed in var.products[*].canary_things.
 # ---------------------------------------------------------------------------
 resource "aws_iot_thing_group" "fleet" {
-  name = "${var.project_name}-fleet"
+  for_each = local.products
+  name     = each.value.fleet_group_name
 
   properties {
-    description = "All provisioned gateways. OTA jobs target this group."
+    description = "All provisioned ${each.value.description} devices. OTA jobs for product '${each.key}' target this group."
   }
 }
 
 resource "aws_iot_thing_group" "canary" {
-  name              = "${var.project_name}-canary"
-  parent_group_name = aws_iot_thing_group.fleet.name
+  for_each          = local.products
+  name              = each.value.canary_group_name
+  parent_group_name = aws_iot_thing_group.fleet[each.key].name
 
   properties {
-    description = "Bench and test gateways. A child of the fleet group, so they receive every fleet OTA job."
+    description = "Bench and test ${each.value.description} devices. A child of the fleet group, so they receive every fleet OTA job."
   }
 }
 
-resource "aws_iot_thing_group_membership" "canary" {
-  for_each = toset(var.ota_canary_things)
+locals {
+  canary_memberships = merge([
+    for id, p in local.products : {
+      for thing in p.canary_things : "${id}/${thing}" => { product = id, thing = thing }
+    }
+  ]...)
+}
 
-  thing_name       = each.value
-  thing_group_name = aws_iot_thing_group.canary.name
+resource "aws_iot_thing_group_membership" "canary" {
+  for_each = local.canary_memberships
+
+  thing_name       = each.value.thing
+  thing_group_name = aws_iot_thing_group.canary[each.value.product].name
 }
 
 # ---------------------------------------------------------------------------
-# 4) Fleet Provisioning Template.
+# 4) Fleet Provisioning Templates, one per product.
 #    Defines which thing/cert/policy will be created in the RegisterThing call.
-#    pre_provisioning_hook: Lambda validation is required on each request.
+#    pre_provisioning_hook: Lambda validation is required on each request; it
+#    also checks that the device is registered for THIS template's product.
 # ---------------------------------------------------------------------------
 resource "aws_iot_provisioning_template" "fleet" {
-  name                  = var.provisioning_template_name
-  description           = "ESP32-S3 zero-touch fleet provisioning (by claim)"
+  for_each = local.products
+
+  name                  = each.value.provisioning_template_name
+  description           = "${each.value.description}: zero-touch fleet provisioning (by claim)"
   provisioning_role_arn = aws_iam_role.provisioning.arn
   enabled               = true
 
@@ -175,8 +194,10 @@ resource "aws_iot_provisioning_template" "fleet" {
     Parameters = {
       SerialNumber = { Type = "String" }
       MacAddress   = { Type = "String" }
-      # Secret goes to the hook but is not used in the thing resource.
-      Secret                      = { Type = "String" }
+      # Secret goes to the hook but is not used in the thing resource. Products
+      # that enrol with a secure element prove themselves with their key
+      # instead and may leave it out.
+      Secret                      = { Type = "String", Default = "" }
       "AWS::IoT::Certificate::Id" = { Type = "String" }
     }
 
@@ -201,10 +222,12 @@ resource "aws_iot_provisioning_template" "fleet" {
         Properties = {
           ThingName = { Ref = "SerialNumber" }
           AttributePayload = {
-            mac = { Ref = "MacAddress" }
+            mac     = { Ref = "MacAddress" }
+            product = each.key
           }
-          # New devices join the fleet group, so they get the OTA job in flight.
-          ThingGroups = [aws_iot_thing_group.fleet.name]
+          # New devices join their product's fleet group, so they get the OTA
+          # job in flight for that product.
+          ThingGroups = [aws_iot_thing_group.fleet[each.key].name]
         }
         OverrideSettings = {
           AttributePayload = "MERGE"
@@ -223,6 +246,28 @@ resource "aws_iot_provisioning_template" "fleet" {
     aws_lambda_permission.allow_iot,
     aws_iam_role_policy_attachment.provisioning,
   ]
+}
+
+# The single-product resources became the gateway's entries. These keep them in
+# place instead of destroying and recreating them (which would empty the groups).
+moved {
+  from = aws_iot_thing_group.fleet
+  to   = aws_iot_thing_group.fleet["gateway"]
+}
+
+moved {
+  from = aws_iot_thing_group.canary
+  to   = aws_iot_thing_group.canary["gateway"]
+}
+
+moved {
+  from = aws_iot_thing_group_membership.canary["28848553144F"]
+  to   = aws_iot_thing_group_membership.canary["gateway/28848553144F"]
+}
+
+moved {
+  from = aws_iot_provisioning_template.fleet
+  to   = aws_iot_provisioning_template.fleet["gateway"]
 }
 
 # ---------------------------------------------------------------------------

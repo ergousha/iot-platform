@@ -59,15 +59,17 @@ func (m *MockIoTClient) cancelledIDs() []string {
 }
 
 const (
-	testGroupARN = "arn:aws:iot:eu-central-1:123456789012:thinggroup/esp32-ztp-fleet"
-	testRoleARN  = "arn:aws:iam::123456789012:role/esp32-ztp-ota-presign-role"
+	testGroupARN       = "arn:aws:iot:eu-central-1:123456789012:thinggroup/esp32-ztp-fleet"
+	testVaktusGroupARN = "arn:aws:iot:eu-central-1:123456789012:thinggroup/esp32-ztp-vaktus-fleet"
+	testRoleARN        = "arn:aws:iam::123456789012:role/esp32-ztp-ota-presign-role"
 )
 
 // validEnv is a complete, valid Lambda environment.
 func validEnv() map[string]string {
 	return map[string]string{
 		"AWS_REGION":                       "eu-central-1",
-		"OTA_THING_GROUP_ARN":              testGroupARN,
+		"OTA_PRODUCT_GROUPS":               `{"gateway":"` + testGroupARN + `","vaktus":"` + testVaktusGroupARN + `"}`,
+		"OTA_LEGACY_ROOT_PRODUCT":          "gateway",
 		"OTA_PRESIGN_ROLE_ARN":             testRoleARN,
 		"OTA_ROLLOUT_BASE_RATE_PER_MINUTE": "1",
 		"OTA_ROLLOUT_INCREMENT_FACTOR":     "2",
@@ -82,9 +84,12 @@ func validEnv() map[string]string {
 // testConfig is what validEnv parses to.
 func testConfig() OTAConfig {
 	return OTAConfig{
-		Region:                   "eu-central-1",
-		ThingGroupARN:            testGroupARN,
-		ThingGroupName:           "esp32-ztp-fleet",
+		Region: "eu-central-1",
+		Products: map[string]ProductGroup{
+			"gateway": {ARN: testGroupARN, Name: "esp32-ztp-fleet"},
+			"vaktus":  {ARN: testVaktusGroupARN, Name: "esp32-ztp-vaktus-fleet"},
+		},
+		LegacyRootProduct:        "gateway",
 		PresignRoleARN:           testRoleARN,
 		RolloutBaseRatePerMinute: 1,
 		RolloutIncrementFactor:   2,
@@ -96,10 +101,11 @@ func testConfig() OTAConfig {
 	}
 }
 
-// Upload time of the test event, and the job ID it maps to.
+// Upload time of the test event, and the job ID a root-level (legacy gateway)
+// upload of firmware_v1.0.0.bin maps to.
 var testUploadTime = time.UnixMilli(1790500000123).UTC()
 
-const testJobID = "ota-firmware_v1-0-0-1790500000123"
+const testJobID = "ota-gateway-firmware_v1-0-0-1790500000123"
 
 func s3Event(key string) events.S3Event {
 	return events.S3Event{
@@ -133,28 +139,28 @@ func TestBuildJobID(t *testing.T) {
 		{
 			name:     "Simple version",
 			version:  "v1.0.0",
-			expected: "ota-v1-0-0-1700000000",
+			expected: "ota-vaktus-v1-0-0-1700000000",
 		},
 		{
 			name:     "Invalid characters replaced",
 			version:  "release/v2.1.0-beta@foo",
-			expected: "ota-release-v2-1-0-beta-foo-1700000000",
+			expected: "ota-vaktus-release-v2-1-0-beta-foo-1700000000",
 		},
 		{
 			name:     "Extremely long version truncated",
 			version:  strings.Repeat("a", 100),
-			expected: "ota-" + strings.Repeat("a", 49) + "-1700000000", // 64 - 4 (prefix) - 11 (suffix) = 49
+			expected: "ota-vaktus-" + strings.Repeat("a", 42) + "-1700000000", // 64 - 11 (prefix) - 11 (suffix) = 42
 		},
 		{
 			name:     "Empty version fallback",
 			version:  "",
-			expected: "ota-firmware-1700000000",
+			expected: "ota-vaktus-firmware-1700000000",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildJobID(tt.version, timestamp)
+			result := buildJobID("vaktus", tt.version, timestamp)
 			if result != tt.expected {
 				t.Errorf("expected %s, got %s", tt.expected, result)
 			}
@@ -164,8 +170,8 @@ func TestBuildJobID(t *testing.T) {
 		})
 	}
 
-	// A millisecond timestamp still fits.
-	if id := buildJobID(strings.Repeat("a", 100), testUploadTime.UnixMilli()); len(id) != 64 {
+	// A millisecond timestamp and the longest product id still fit.
+	if id := buildJobID(strings.Repeat("p", 16), strings.Repeat("a", 100), testUploadTime.UnixMilli()); len(id) != 64 {
 		t.Errorf("expected a 64-char job ID, got %s (len: %d)", id, len(id))
 	}
 }
@@ -249,11 +255,16 @@ func TestLoadConfig(t *testing.T) {
 		value   string // "" unsets the variable
 		wantErr string
 	}{
-		{"Missing thing group", "OTA_THING_GROUP_ARN", "", "OTA_THING_GROUP_ARN is not set"},
-		{"Thing group not an ARN", "OTA_THING_GROUP_ARN", "esp32-ztp-fleet", "OTA_THING_GROUP_ARN"},
-		{"Thing group ARN of a thing", "OTA_THING_GROUP_ARN", "arn:aws:iot:eu-central-1:123456789012:thing/28848553144F", "OTA_THING_GROUP_ARN"},
-		{"Thing group ARN without a name", "OTA_THING_GROUP_ARN", "arn:aws:iot:eu-central-1:123456789012:thinggroup/", "OTA_THING_GROUP_ARN"},
-		{"Thing group ARN of another service", "OTA_THING_GROUP_ARN", "arn:aws:s3:eu-central-1:123456789012:thinggroup/x", "OTA_THING_GROUP_ARN"},
+		{"Missing product groups", "OTA_PRODUCT_GROUPS", "", "OTA_PRODUCT_GROUPS is not set"},
+		{"Product groups not JSON", "OTA_PRODUCT_GROUPS", testGroupARN, "OTA_PRODUCT_GROUPS"},
+		{"Product groups empty", "OTA_PRODUCT_GROUPS", "{}", "OTA_PRODUCT_GROUPS"},
+		{"Product group not an ARN", "OTA_PRODUCT_GROUPS", `{"gateway":"esp32-ztp-fleet"}`, `product "gateway"`},
+		{"Product group ARN of a thing", "OTA_PRODUCT_GROUPS", `{"gateway":"arn:aws:iot:eu-central-1:123456789012:thing/28848553144F"}`, `product "gateway"`},
+		{"Product group ARN without a name", "OTA_PRODUCT_GROUPS", `{"gateway":"arn:aws:iot:eu-central-1:123456789012:thinggroup/"}`, `product "gateway"`},
+		{"Product group ARN of another service", "OTA_PRODUCT_GROUPS", `{"gateway":"arn:aws:s3:eu-central-1:123456789012:thinggroup/x"}`, `product "gateway"`},
+		{"Product id with a slash", "OTA_PRODUCT_GROUPS", `{"a/b":"` + testGroupARN + `"}`, `product "a/b"`},
+		{"Product id in capitals", "OTA_PRODUCT_GROUPS", `{"Gateway":"` + testGroupARN + `"}`, `product "Gateway"`},
+		{"Legacy product unknown", "OTA_LEGACY_ROOT_PRODUCT", "sensor", "OTA_LEGACY_ROOT_PRODUCT"},
 		{"Missing presign role", "OTA_PRESIGN_ROLE_ARN", "", "OTA_PRESIGN_ROLE_ARN is not set"},
 		{"Presign role ARN of a user", "OTA_PRESIGN_ROLE_ARN", "arn:aws:iam::123456789012:user/someone", "OTA_PRESIGN_ROLE_ARN"},
 		{"Missing region", "AWS_REGION", "", "AWS_REGION is not set"},
@@ -293,6 +304,15 @@ func TestLoadConfig(t *testing.T) {
 		})
 	}
 
+	t.Run("No legacy product", func(t *testing.T) {
+		env := validEnv()
+		delete(env, "OTA_LEGACY_ROOT_PRODUCT")
+		cfg, err := loadConfig(func(k string) string { return env[k] })
+		if err != nil || cfg.LegacyRootProduct != "" {
+			t.Errorf("expected no legacy product and no error, got %q, %v", cfg.LegacyRootProduct, err)
+		}
+	})
+
 	t.Run("Base rate above maximum rate", func(t *testing.T) {
 		env := validEnv()
 		env["OTA_ROLLOUT_BASE_RATE_PER_MINUTE"] = "30"
@@ -304,13 +324,13 @@ func TestLoadConfig(t *testing.T) {
 
 	t.Run("Every problem reported at once", func(t *testing.T) {
 		env := validEnv()
-		delete(env, "OTA_THING_GROUP_ARN")
+		delete(env, "OTA_PRODUCT_GROUPS")
 		env["OTA_IN_PROGRESS_TIMEOUT_MINUTES"] = "forever"
 		_, err := loadConfig(func(k string) string { return env[k] })
 		if err == nil {
 			t.Fatal("expected an error")
 		}
-		for _, name := range []string{"OTA_THING_GROUP_ARN", "OTA_IN_PROGRESS_TIMEOUT_MINUTES"} {
+		for _, name := range []string{"OTA_PRODUCT_GROUPS", "OTA_IN_PROGRESS_TIMEOUT_MINUTES"} {
 			if !strings.Contains(err.Error(), name) {
 				t.Errorf("expected error to mention %s, got: %v", name, err)
 			}
@@ -323,11 +343,11 @@ func TestCreateJobRequest(t *testing.T) {
 	mockIoT := &MockIoTClient{}
 	app := &App{iotClient: mockIoT, cfg: testConfig()}
 
-	resp, err := app.Handler(context.Background(), s3Event("firmware/firmware_v1.0.0.bin"))
+	resp, err := app.Handler(context.Background(), s3Event("vaktus/firmware_v1.0.0.bin"))
 	if err != nil {
 		t.Fatalf("unexpected handler error: %v", err)
 	}
-	if resp.StatusCode != 200 || !strings.Contains(resp.Body, "created for thing group esp32-ztp-fleet") {
+	if resp.StatusCode != 200 || !strings.Contains(resp.Body, "created for thing group esp32-ztp-vaktus-fleet") {
 		t.Errorf("unexpected response: %+v", resp)
 	}
 	if len(mockIoT.createJobCalls) != 1 {
@@ -335,11 +355,14 @@ func TestCreateJobRequest(t *testing.T) {
 	}
 	in := mockIoT.createJobCalls[0]
 
-	if got := aws.ToString(in.JobId); got != testJobID {
-		t.Errorf("expected JobId %s, got %s", testJobID, got)
+	if got, want := aws.ToString(in.JobId), "ota-vaktus-firmware_v1-0-0-1790500000123"; got != want {
+		t.Errorf("expected JobId %s, got %s", want, got)
 	}
-	if !reflect.DeepEqual(in.Targets, []string{testGroupARN}) {
-		t.Errorf("expected the thing group as the only target, got %v", in.Targets)
+	if !reflect.DeepEqual(in.Targets, []string{testVaktusGroupARN}) {
+		t.Errorf("expected the product's thing group as the only target, got %v", in.Targets)
+	}
+	if got := aws.ToString(in.Description); got != "OTA update firmware_v1.0.0 for vaktus" {
+		t.Errorf("unexpected description %q", got)
 	}
 	if in.TargetSelection != iottypes.TargetSelectionContinuous {
 		t.Errorf("expected CONTINUOUS, got %s", in.TargetSelection)
@@ -351,8 +374,9 @@ func TestCreateJobRequest(t *testing.T) {
 	}
 	wantDoc := map[string]string{
 		"operation":        "firmware_update",
+		"product":          "vaktus",
 		"firmware_version": "firmware_v1.0.0",
-		"download_url":     "${aws:iot:s3-presigned-url-v2:https://s3.eu-central-1.amazonaws.com/test-bucket/firmware/firmware_v1.0.0.bin}",
+		"download_url":     "${aws:iot:s3-presigned-url-v2:https://s3.eu-central-1.amazonaws.com/test-bucket/vaktus/firmware_v1.0.0.bin}",
 	}
 	if !reflect.DeepEqual(doc, wantDoc) {
 		t.Errorf("expected job document %v, got %v", wantDoc, doc)
@@ -395,7 +419,7 @@ func TestCreateJobRequest(t *testing.T) {
 		t.Fatalf("expected 1 ListJobs call, got %d", len(mockIoT.listJobsCalls))
 	}
 	list := mockIoT.listJobsCalls[0]
-	if aws.ToString(list.ThingGroupName) != "esp32-ztp-fleet" || list.Status != iottypes.JobStatusInProgress {
+	if aws.ToString(list.ThingGroupName) != "esp32-ztp-vaktus-fleet" || list.Status != iottypes.JobStatusInProgress {
 		t.Errorf("unexpected ListJobs filter: group=%s status=%s", aws.ToString(list.ThingGroupName), list.Status)
 	}
 	if len(mockIoT.cancelJobCalls) != 0 {
@@ -585,5 +609,80 @@ func TestOTAHandler(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRoute(t *testing.T) {
+	cfg := testConfig()
+	tests := []struct {
+		key     string
+		product string
+		ok      bool
+	}{
+		{"firmware_v0.3.0.bin", "gateway", true}, // bucket root: the legacy product
+		{"gateway/firmware_v0.3.0.bin", "gateway", true},
+		{"vaktus/firmware_v0.8.0.bin", "vaktus", true},
+		{"sensor/firmware_v1.0.0.bin", "", false},      // no such product
+		{"vaktus/beta/firmware_v0.8.0.bin", "", false}, // only <product>/<file>
+		{"vaktus/", "", false},                         // no file
+		{"Vaktus/firmware_v0.8.0.bin", "", false},      // ids are lowercase
+		{"firmware/firmware_v1.0.0.bin", "", false},    // the old "firmware/" folder is not a product
+		{"/firmware_v1.0.0.bin", "", false},            // empty product segment
+		{"gateway/../vaktus/firmware.bin", "", false},  // no path tricks
+	}
+	for _, tt := range tests {
+		product, ok := cfg.route(tt.key)
+		if product != tt.product || ok != tt.ok {
+			t.Errorf("route(%q) = %q, %v; want %q, %v", tt.key, product, ok, tt.product, tt.ok)
+		}
+	}
+
+	cfg.LegacyRootProduct = ""
+	if product, ok := cfg.route("firmware_v0.3.0.bin"); ok {
+		t.Errorf("without a legacy product a root upload must be ignored, got %q", product)
+	}
+}
+
+func TestHandlerIgnoresUploadsOfNoProduct(t *testing.T) {
+	mockIoT := &MockIoTClient{}
+	app := &App{iotClient: mockIoT, cfg: testConfig()}
+
+	resp, err := app.Handler(context.Background(), s3Event("sensor/firmware_v1.0.0.bin"))
+	if err != nil {
+		t.Fatalf("an ignored upload must not fail (Lambda would retry it): %v", err)
+	}
+	if resp.StatusCode != 200 || !strings.Contains(resp.Body, "belongs to no product") {
+		t.Errorf("unexpected response: %+v", resp)
+	}
+	if len(mockIoT.createJobCalls) != 0 || len(mockIoT.listJobsCalls) != 0 || len(mockIoT.cancelJobCalls) != 0 {
+		t.Errorf("expected no IoT calls, got %d creates, %d lists, %d cancels",
+			len(mockIoT.createJobCalls), len(mockIoT.listJobsCalls), len(mockIoT.cancelJobCalls))
+	}
+}
+
+// One product's release never cancels another product's job: each lists and
+// cancels only within its own fleet group.
+func TestReleaseLeavesOtherProductsAlone(t *testing.T) {
+	jobsByGroup := map[string][]string{
+		"esp32-ztp-fleet":        {"ota-firmware_v0-2-1-1790400000000"}, // the gateway's live release
+		"esp32-ztp-vaktus-fleet": {"ota-vaktus-firmware_v0-7-0-1790300000000"},
+	}
+	mockIoT := &MockIoTClient{
+		ListJobsFunc: func(ctx context.Context, params *iot.ListJobsInput) (*iot.ListJobsOutput, error) {
+			return &iot.ListJobsOutput{Jobs: jobSummaries(jobsByGroup[aws.ToString(params.ThingGroupName)]...)}, nil
+		},
+	}
+	app := &App{iotClient: mockIoT, cfg: testConfig()}
+
+	if _, err := app.Handler(context.Background(), s3Event("vaktus/firmware_v0.8.0.bin")); err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	for _, list := range mockIoT.listJobsCalls {
+		if g := aws.ToString(list.ThingGroupName); g != "esp32-ztp-vaktus-fleet" {
+			t.Errorf("a vaktus release listed jobs of group %s", g)
+		}
+	}
+	if got, want := mockIoT.cancelledIDs(), []string{"ota-vaktus-firmware_v0-7-0-1790300000000"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("expected only the older vaktus job cancelled, got %v", got)
 	}
 }
