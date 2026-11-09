@@ -3,22 +3,27 @@ output "iot_endpoint" {
   value       = data.aws_iot_endpoint.ats.endpoint_address
 }
 
-output "provisioning_template_name" {
-  description = "Must match the template name in firmware."
-  value       = aws_iot_provisioning_template.fleet.name
+output "provisioning_template_names" {
+  description = "Provisioning template of each product (also in SSM at /esp32-ztp/poc/<product>/provisioning_template_name)."
+  value       = { for id, t in aws_iot_provisioning_template.fleet : id => t.name }
+}
+
+output "fleet_thing_groups" {
+  description = "Fleet thing group of each product: the target of its OTA jobs."
+  value       = { for id, g in aws_iot_thing_group.fleet : id => g.name }
 }
 
 output "dynamodb_table" {
   value = aws_dynamodb_table.device_registry.name
 }
 
-output "github_actions_role_arn" {
-  description = "IAM role assumed by the release workflow through GitHub OIDC."
-  value       = aws_iam_role.github_actions.arn
+output "github_actions_role_arns" {
+  description = "IAM role each product's release workflow assumes through GitHub OIDC (the repository's AWS_ROLE_ARN variable)."
+  value       = { for id, r in aws_iam_role.github_actions : id => r.arn }
 }
 
 output "firmware_bucket_name" {
-  description = "S3 bucket where the release workflow uploads firmware images."
+  description = "S3 bucket where the release workflows upload firmware images, each under s3://<bucket>/<product>/."
   value       = aws_s3_bucket.firmware.id
 }
 

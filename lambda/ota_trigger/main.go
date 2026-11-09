@@ -41,13 +41,28 @@ type IoTAPI interface {
 	CancelJob(ctx context.Context, params *iot.CancelJobInput, optFns ...func(*iot.Options)) (*iot.CancelJobOutput, error)
 }
 
+// productIDPattern is what Terraform accepts as a product id.
+var productIDPattern = regexp.MustCompile(`^[a-z][a-z0-9]{1,15}$`)
+
+// ProductGroup is the fleet thing group a product's OTA jobs target.
+type ProductGroup struct {
+	ARN  string
+	Name string
+}
+
 // OTAConfig is the deployment configuration: the OTA_* environment variables
 // Terraform sets, plus the AWS_REGION the Lambda runtime sets (the bucket's
 // region too, since S3 only notifies functions in its own region).
 type OTAConfig struct {
-	Region         string
-	ThingGroupARN  string
-	ThingGroupName string
+	Region string
+
+	// Products maps each product id to its fleet thing group. An upload under
+	// <id>/ becomes a job for that group only.
+	Products map[string]ProductGroup
+	// LegacyRootProduct owns uploads at the bucket root, where releases went
+	// before there were products. Empty: such uploads are ignored.
+	LegacyRootProduct string
+
 	PresignRoleARN string
 
 	RolloutBaseRatePerMinute int32
@@ -122,6 +137,17 @@ func (p *envParser) decimal(name string, places int, lo, hi float64) float64 {
 	return f
 }
 
+// resourceName returns <name> from an ARN of the given service whose resource
+// is `<resourceType>/<name>`.
+func resourceName(value, service, resourceType string) (string, bool) {
+	parsed, err := arn.Parse(value)
+	name, found := strings.CutPrefix(parsed.Resource, resourceType+"/")
+	if err != nil || parsed.Service != service || !found || name == "" {
+		return "", false
+	}
+	return name, true
+}
+
 // arnName parses an ARN for the given service whose resource is
 // `<resourceType>/<name>`, and returns the ARN and the name.
 func (p *envParser) arnName(name, service, resourceType string) (string, string) {
@@ -129,13 +155,35 @@ func (p *envParser) arnName(name, service, resourceType string) (string, string)
 	if !ok {
 		return "", ""
 	}
-	parsed, err := arn.Parse(value)
-	resourceName, found := strings.CutPrefix(parsed.Resource, resourceType+"/")
-	if err != nil || parsed.Service != service || !found || resourceName == "" {
+	resource, ok := resourceName(value, service, resourceType)
+	if !ok {
 		p.fail(name, value, "must be an ARN of the form arn:aws:%s:...:%s/<name>", service, resourceType)
 		return "", ""
 	}
-	return value, resourceName
+	return value, resource
+}
+
+// productGroups parses a JSON object of product id -> thing group ARN.
+func (p *envParser) productGroups(name string) map[string]ProductGroup {
+	value, ok := p.required(name)
+	if !ok {
+		return nil
+	}
+	var raw map[string]string
+	if err := json.Unmarshal([]byte(value), &raw); err != nil || len(raw) == 0 {
+		p.fail(name, value, "must be a non-empty JSON object of product id to thing group ARN")
+		return nil
+	}
+	groups := make(map[string]ProductGroup, len(raw))
+	for id, groupARN := range raw {
+		groupName, ok := resourceName(groupARN, "iot", "thinggroup")
+		if !productIDPattern.MatchString(id) || !ok {
+			p.fail(name, value, "product %q: needs an id of 2-16 lowercase letters and digits and an ARN of the form arn:aws:iot:...:thinggroup/<name>", id)
+			continue
+		}
+		groups[id] = ProductGroup{ARN: groupARN, Name: groupName}
+	}
+	return groups
 }
 
 // loadConfig reads and validates the configuration from the environment.
@@ -149,7 +197,12 @@ func loadConfig(getenv func(string) string) (OTAConfig, error) {
 	var c OTAConfig
 
 	c.Region, _ = p.required("AWS_REGION")
-	c.ThingGroupARN, c.ThingGroupName = p.arnName("OTA_THING_GROUP_ARN", "iot", "thinggroup")
+	c.Products = p.productGroups("OTA_PRODUCT_GROUPS")
+	// Optional: empty means root-level uploads belong to no product.
+	c.LegacyRootProduct = getenv("OTA_LEGACY_ROOT_PRODUCT")
+	if _, known := c.Products[c.LegacyRootProduct]; c.LegacyRootProduct != "" && c.Products != nil && !known {
+		p.fail("OTA_LEGACY_ROOT_PRODUCT", c.LegacyRootProduct, "is not one of the products in OTA_PRODUCT_GROUPS")
+	}
 	c.PresignRoleARN, _ = p.arnName("OTA_PRESIGN_ROLE_ARN", "iam", "role")
 
 	c.RolloutBaseRatePerMinute = int32(p.integer("OTA_ROLLOUT_BASE_RATE_PER_MINUTE", 1, 1000))
@@ -172,15 +225,16 @@ func loadConfig(getenv func(string) string) (OTAConfig, error) {
 	return c, nil
 }
 
-// buildJobID normalizes and limits the job ID to 64 characters to comply with AWS requirements.
-func buildJobID(version string, timestamp int64) string {
+// buildJobID builds `ota-<product>-<version>-<timestamp>`, with the version
+// normalized and shortened so the ID fits the 64 characters AWS IoT allows.
+func buildJobID(product, version string, timestamp int64) string {
 	reg := regexp.MustCompile(`[^A-Za-z0-9_-]+`)
 	safeVersion := reg.ReplaceAllString(version, "-")
 	safeVersion = strings.Trim(safeVersion, "-_")
 	if safeVersion == "" {
 		safeVersion = "firmware"
 	}
-	prefix := jobIDPrefix
+	prefix := jobIDPrefix + product + "-"
 	suffix := fmt.Sprintf("-%d", timestamp)
 	const maxJobIDLength = 64
 	availableLength := maxJobIDLength - len(prefix) - len(suffix)
@@ -233,20 +287,34 @@ func presignedURLPlaceholder(region, bucket, key string) string {
 	return fmt.Sprintf("${aws:iot:s3-presigned-url-v2:https://s3.%s.amazonaws.com/%s/%s}", region, bucket, s3EscapeKey(key))
 }
 
-// createJobInput builds the OTA job for the thing group.
+// route returns the product an uploaded object belongs to: `<product>/<file>`
+// for a configured product, or a file at the bucket root for the legacy
+// product. Anything else (an unknown prefix, a deeper path) belongs to none.
+func (c OTAConfig) route(key string) (string, bool) {
+	dir, file, nested := strings.Cut(key, "/")
+	if !nested {
+		return c.LegacyRootProduct, c.LegacyRootProduct != ""
+	}
+	if _, known := c.Products[dir]; !known || file == "" || strings.Contains(file, "/") {
+		return "", false
+	}
+	return dir, true
+}
+
+// createJobInput builds the OTA job for the product's thing group.
 //
 // CONTINUOUS so a device that joins the group after the upload (a newly
 // provisioned one) still gets the release. The rollout starts slowly and only
 // speeds up as devices report SUCCEEDED; the abort criterion cancels the job
 // once too many executions end badly; the timeout turns a device that never
 // reports back into TIMED_OUT instead of IN_PROGRESS forever.
-func (a *App) createJobInput(jobID, version, document string) *iot.CreateJobInput {
+func (a *App) createJobInput(product string, group ProductGroup, jobID, version, document string) *iot.CreateJobInput {
 	c := a.cfg
 	return &iot.CreateJobInput{
 		JobId:           aws.String(jobID),
-		Targets:         []string{c.ThingGroupARN},
+		Targets:         []string{group.ARN},
 		Document:        aws.String(document),
-		Description:     aws.String(fmt.Sprintf("OTA Update for %s", version)),
+		Description:     aws.String(fmt.Sprintf("OTA update %s for %s", version, product)),
 		TargetSelection: types.TargetSelectionContinuous,
 		PresignedUrlConfig: &types.PresignedUrlConfig{
 			RoleArn:      aws.String(c.PresignRoleARN),
@@ -279,8 +347,9 @@ func (a *App) createJobInput(jobID, version, document string) *iot.CreateJobInpu
 	}
 }
 
-// cancelSupersededJobs keeps one OTA job in flight for the thing group: the
-// newest upload. A CONTINUOUS job never completes on its own, so without this
+// cancelSupersededJobs keeps one OTA job in flight for the product's thing
+// group: the newest upload. Each product has its own group, so a release only
+// ever supersedes releases of the same product. A CONTINUOUS job never completes on its own, so without this
 // every release would stay active forever, and a device joining the group would
 // be sent all of them, oldest first.
 //
@@ -290,18 +359,18 @@ func (a *App) createJobInput(jobID, version, document string) *iot.CreateJobInpu
 // out-of-order invocations converge on the same survivor; if a newer job is
 // already active, jobID itself is the one cancelled. created says whether this
 // invocation created jobID. It returns the surviving job's ID.
-func (a *App) cancelSupersededJobs(ctx context.Context, jobID string, created bool) (string, error) {
+func (a *App) cancelSupersededJobs(ctx context.Context, group ProductGroup, jobID string, created bool) (string, error) {
 	var active []string
 	ownActive := created
 
 	paginator := iot.NewListJobsPaginator(a.iotClient, &iot.ListJobsInput{
 		Status:         types.JobStatusInProgress,
-		ThingGroupName: aws.String(a.cfg.ThingGroupName),
+		ThingGroupName: aws.String(group.Name),
 	})
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return "", fmt.Errorf("listing jobs for thing group %s: %w", a.cfg.ThingGroupName, err)
+			return "", fmt.Errorf("listing jobs for thing group %s: %w", group.Name, err)
 		}
 		for _, job := range page.Jobs {
 			id := aws.ToString(job.JobId)
@@ -349,8 +418,9 @@ func (a *App) cancelSupersededJobs(ctx context.Context, jobID string, created bo
 	return newest, errors.Join(errs...)
 }
 
-// Handler turns a firmware upload into an OTA job for the configured thing
-// group, then cancels the group's older OTA jobs.
+// Handler turns a firmware upload into an OTA job for its product's thing
+// group, then cancels that group's older OTA jobs. An upload that belongs to no
+// product is logged and ignored, never retried.
 //
 // Failures are returned as errors so Lambda retries the asynchronous S3 event.
 // That is safe: the job ID is derived from the upload, so a retried or
@@ -371,7 +441,14 @@ func (a *App) Handler(ctx context.Context, event events.S3Event) (Response, erro
 		objectKey = record.S3.Object.Key
 	}
 
-	// Extract version from the object key (e.g. firmware_v0.0.1.bin)
+	product, ok := a.cfg.route(objectKey)
+	if !ok {
+		slog.Warn("Ignoring upload: its key belongs to no product", "key", objectKey)
+		return Response{StatusCode: 200, Body: fmt.Sprintf("Ignored %s: it belongs to no product.", objectKey)}, nil
+	}
+	group := a.cfg.Products[product]
+
+	// Extract version from the object key (e.g. vaktus/firmware_v0.0.1.bin)
 	parts := strings.Split(objectKey, "/")
 	version := strings.TrimSuffix(parts[len(parts)-1], ".bin")
 
@@ -382,13 +459,15 @@ func (a *App) Handler(ctx context.Context, event events.S3Event) (Response, erro
 		slog.Warn("S3 event has no eventTime; using the current time")
 		uploadedAt = time.Now()
 	}
-	jobID := buildJobID(version, uploadedAt.UnixMilli())
+	jobID := buildJobID(product, version, uploadedAt.UnixMilli())
 
-	// The document the firmware parses, with the same fields as before. AWS IoT
-	// replaces the download_url placeholder with an HTTPS URL when the device
-	// fetches the document (and the firmware refuses anything that is not https).
+	// The document the firmware parses. AWS IoT replaces the download_url
+	// placeholder with an HTTPS URL when the device fetches the document (and
+	// the firmware refuses anything that is not https). `product` lets a device
+	// refuse an image meant for another product; older firmware ignores it.
 	jobDocument := map[string]interface{}{
 		"operation":        "firmware_update",
+		"product":          product,
 		"firmware_version": version,
 		"download_url":     presignedURLPlaceholder(a.cfg.Region, bucketName, objectKey),
 	}
@@ -399,7 +478,7 @@ func (a *App) Handler(ctx context.Context, event events.S3Event) (Response, erro
 	}
 
 	created := true
-	_, err = a.iotClient.CreateJob(ctx, a.createJobInput(jobID, version, string(docBytes)))
+	_, err = a.iotClient.CreateJob(ctx, a.createJobInput(product, group, jobID, version, string(docBytes)))
 	var exists *types.ResourceAlreadyExistsException
 	switch {
 	case errors.As(err, &exists):
@@ -409,10 +488,10 @@ func (a *App) Handler(ctx context.Context, event events.S3Event) (Response, erro
 		slog.Error("Error creating job", "error", err)
 		return Response{StatusCode: 500, Body: "Error creating job"}, err
 	default:
-		slog.Info("Created job successfully", "jobID", jobID, "thingGroup", a.cfg.ThingGroupName)
+		slog.Info("Created job successfully", "jobID", jobID, "product", product, "thingGroup", group.Name)
 	}
 
-	newest, err := a.cancelSupersededJobs(ctx, jobID, created)
+	newest, err := a.cancelSupersededJobs(ctx, group, jobID, created)
 	if err != nil {
 		slog.Error("Error cancelling superseded jobs", "error", err)
 		return Response{StatusCode: 500, Body: "Error cancelling superseded jobs"}, err
@@ -426,7 +505,7 @@ func (a *App) Handler(ctx context.Context, event events.S3Event) (Response, erro
 
 	return Response{
 		StatusCode: 200,
-		Body:       fmt.Sprintf("OTA job %s created for thing group %s.", jobID, a.cfg.ThingGroupName),
+		Body:       fmt.Sprintf("OTA job %s created for thing group %s.", jobID, group.Name),
 	}, nil
 }
 

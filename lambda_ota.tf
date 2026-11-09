@@ -55,16 +55,16 @@ resource "aws_iam_role_policy" "ota_trigger" {
       },
       {
         # CreateJob is authorised against the job being created AND every
-        # target; the only target is the fleet thing group.
+        # target; the targets are the products' fleet thing groups.
         Effect = "Allow"
         Action = "iot:CreateJob"
-        Resource = [
-          "${local.iot_arn}:job/ota-*",
-          aws_iot_thing_group.fleet.arn,
-        ]
+        Resource = concat(
+          ["${local.iot_arn}:job/ota-*"],
+          [for g in aws_iot_thing_group.fleet : g.arn],
+        )
       },
       {
-        # A new release cancels the group's older OTA jobs.
+        # A new release cancels the older OTA jobs of its product's group.
         Effect   = "Allow"
         Action   = "iot:CancelJob"
         Resource = "${local.iot_arn}:job/ota-*"
@@ -146,8 +146,12 @@ resource "aws_lambda_function" "ota_trigger" {
   # missing or invalid.
   environment {
     variables = {
-      S3_BUCKET_NAME                   = aws_s3_bucket.firmware.bucket
-      OTA_THING_GROUP_ARN              = aws_iot_thing_group.fleet.arn
+      S3_BUCKET_NAME = aws_s3_bucket.firmware.bucket
+      # Product id -> fleet thing group. An upload under <id>/ becomes a job for
+      # that group only; anything else is ignored.
+      OTA_PRODUCT_GROUPS = jsonencode({ for id, g in aws_iot_thing_group.fleet : id => g.arn })
+      # Uploads at the bucket root belong to this product ("" = ignore them).
+      OTA_LEGACY_ROOT_PRODUCT          = local.legacy_product == null ? "" : local.legacy_product
       OTA_PRESIGN_ROLE_ARN             = aws_iam_role.ota_presign.arn
       OTA_ROLLOUT_BASE_RATE_PER_MINUTE = var.ota_rollout_base_rate_per_minute
       OTA_ROLLOUT_INCREMENT_FACTOR     = var.ota_rollout_increment_factor
@@ -182,6 +186,8 @@ resource "aws_lambda_permission" "allow_s3" {
   source_arn    = aws_s3_bucket.firmware.arn
 }
 
+# Every .bin upload reaches the Lambda, which routes it by its key prefix (and
+# ignores keys that belong to no product).
 resource "aws_s3_bucket_notification" "bucket_notification" {
   bucket = aws_s3_bucket.firmware.id
 
