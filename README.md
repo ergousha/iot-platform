@@ -193,7 +193,7 @@ The firmware currently reports SUCCEEDED right after the download, before it reb
 | Product | Fleet group (OTA target) | Canary group (child of fleet) | Provisioning template |
 | :--- | :--- | :--- | :--- |
 | `gateway` | `esp32-ztp-fleet` | `esp32-ztp-canary` (bench unit `28848553144F`) | `esp32-s3-fleet-template` |
-| `vaktus` | `esp32-ztp-vaktus-fleet` | `esp32-ztp-vaktus-canary` | `esp32-ztp-vaktus-fleet-template` |
+| `vaktus` | `esp32-ztp-vaktus-fleet` | `esp32-ztp-vaktus-canary` (bench unit `38182B8456F4`) | `esp32-ztp-vaktus-fleet-template` |
 
 The gateway keeps the names it had before products existed (pinned in `products.gateway`); new products get `esp32-ztp-<id>-…` names. A product's template puts every device it registers into the product's fleet group and sets the thing attribute `product`. The canary group receives every fleet job too, and marks the devices a canary-first rollout would update first.
 
