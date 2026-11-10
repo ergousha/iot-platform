@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-lambda-go/lambda"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -53,6 +54,12 @@ type PreProvisioningResponse struct {
 // PEM "PUBLIC KEY" block, or the hex of an uncompressed P-256 point (130 hex
 // digits starting 04, or the 128 digits of X||Y as an ATECC608 GenKey returns
 // them).
+//
+// A record enrols a device ONCE: provisioned=true rejects every later request,
+// so a leaked claim (or the public gateway secret) cannot enrol a second copy of
+// a device. Re-enrolling (a new key, an erased NVS) means re-registering the
+// device at the bench, which resets provisioned. enrol_by, when set (Unix
+// seconds), closes the record's enrolment window.
 type DeviceItem struct {
 	MacAddress  string `dynamodbav:"mac_address"`
 	Secret      string `dynamodbav:"secret"`
@@ -60,6 +67,7 @@ type DeviceItem struct {
 	Provisioned bool   `dynamodbav:"provisioned"`
 	Product     string `dynamodbav:"product"`
 	PublicKey   string `dynamodbav:"public_key"`
+	EnrolBy     int64  `dynamodbav:"enrol_by"`
 }
 
 // TemplateProduct is what a provisioning template enrols: a product, and
@@ -84,6 +92,15 @@ type App struct {
 	templates map[string]TemplateProduct
 	// legacyRecordProduct owns registry records without a product ("" = none).
 	legacyRecordProduct string
+	// now is the clock enrol_by is checked against (nil = time.Now).
+	now func() time.Time
+}
+
+func (a *App) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 var reject = PreProvisioningResponse{AllowProvisioning: false}
@@ -92,13 +109,13 @@ var reject = PreProvisioningResponse{AllowProvisioning: false}
 // request. Every failure, including an internal one, rejects: the hook fails
 // closed.
 func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvisioningResponse, error) {
-	mac := event.Parameters["MacAddress"]
+	rawMAC := event.Parameters["MacAddress"]
 	secret := event.Parameters["Secret"]
 	serial := event.Parameters["SerialNumber"]
 	templateName := templateNameFromARN(event.TemplateARN)
 
 	slog.Info("Pre-provisioning request received",
-		"mac", mac,
+		"mac", rawMAC,
 		"serial", serial,
 		"template", templateName,
 		"certificateId", event.CertificateID,
@@ -110,8 +127,15 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		return reject, nil
 	}
 
-	if mac == "" {
+	if rawMAC == "" {
 		slog.Warn("REJECTED: MacAddress parameter missing")
+		return reject, nil
+	}
+	// Registry keys are AA:BB:CC:DD:EE:FF. A device sending another spelling
+	// (lowercase, dashes, none) would otherwise miss its record silently.
+	mac, ok := normalizeMAC(rawMAC)
+	if !ok {
+		slog.Warn("REJECTED: MacAddress is not 12 hex digits", "mac", rawMAC)
 		return reject, nil
 	}
 
@@ -153,6 +177,16 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 
 	if !item.Allowed {
 		slog.Warn("REJECTED: allowed=false", "mac", mac)
+		return reject, nil
+	}
+
+	if item.Provisioned {
+		slog.Warn("REJECTED: already enrolled once; re-register the device to enrol it again", "mac", mac)
+		return reject, nil
+	}
+
+	if item.EnrolBy > 0 && a.clock().Unix() > item.EnrolBy {
+		slog.Warn("REJECTED: enrolment window closed", "mac", mac, "enrolBy", time.Unix(item.EnrolBy, 0).UTC())
 		return reject, nil
 	}
 
@@ -200,23 +234,33 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		method = "secret"
 	}
 
-	// Record the provisioning (best-effort)
-
+	// Claim the record. The condition makes this the single enrolment even when
+	// two requests race past the read above; any failure rejects (fail closed),
+	// because an enrolment the registry did not record could be repeated.
 	_, err = a.dbClient.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(a.tableName),
 		Key: map[string]types.AttributeValue{
 			"mac_address": &types.AttributeValueMemberS{Value: mac},
 		},
-		UpdateExpression: aws.String("SET provisioned = :t, last_provisioned_serial = :s, last_certificate_id = :c, last_provisioned_via = :m"),
+		UpdateExpression:    aws.String("SET provisioned = :t, last_provisioned_serial = :s, last_certificate_id = :c, last_provisioned_via = :m, last_provisioned_at = :at"),
+		ConditionExpression: aws.String("allowed = :t AND (attribute_not_exists(provisioned) OR provisioned = :f)"),
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":t": &types.AttributeValueMemberBOOL{Value: true},
-			":s": &types.AttributeValueMemberS{Value: thingName},
-			":c": &types.AttributeValueMemberS{Value: event.CertificateID},
-			":m": &types.AttributeValueMemberS{Value: method},
+			":t":  &types.AttributeValueMemberBOOL{Value: true},
+			":f":  &types.AttributeValueMemberBOOL{Value: false},
+			":s":  &types.AttributeValueMemberS{Value: thingName},
+			":c":  &types.AttributeValueMemberS{Value: event.CertificateID},
+			":m":  &types.AttributeValueMemberS{Value: method},
+			":at": &types.AttributeValueMemberS{Value: a.clock().UTC().Format(time.RFC3339)},
 		},
 	})
 	if err != nil {
-		slog.Error("Failed to update provisioned flag (continuing anyway)", "error", err)
+		var conflict *types.ConditionalCheckFailedException
+		if errors.As(err, &conflict) {
+			slog.Warn("REJECTED: the record was enrolled (or disallowed) concurrently", "mac", mac)
+		} else {
+			slog.Error("REJECTED: could not record the enrolment", "mac", mac, "error", err)
+		}
+		return reject, nil
 	}
 
 	slog.Info("APPROVED: provisioning allowed", "mac", mac, "product", tmpl.Product, "via", method)
@@ -227,6 +271,23 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 			"SerialNumber": thingName,
 		},
 	}, nil
+}
+
+// normalizeMAC returns a MAC in the registry's key form, AA:BB:CC:DD:EE:FF,
+// from any of AA:BB:..., aa-bb-..., or aabbccddeeff.
+func normalizeMAC(mac string) (string, bool) {
+	digits := strings.ToUpper(strings.NewReplacer(":", "", "-", "").Replace(strings.TrimSpace(mac)))
+	if len(digits) != 12 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(digits); err != nil {
+		return "", false
+	}
+	parts := make([]string, 6)
+	for i := range parts {
+		parts[i] = digits[2*i : 2*i+2]
+	}
+	return strings.Join(parts, ":"), true
 }
 
 // thingNameForMAC is the thing name every product uses: the MAC as 12

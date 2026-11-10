@@ -17,10 +17,16 @@ locals {
 # 1) CLAIM (bootstrap) certificate.
 #    COMMON certificate carried by all devices leaving the factory.
 #    Can only access provisioning MQTT topics; cannot send telemetry.
-#    active=true + no csr => AWS generates a keypair, private_key is returned in outputs.
+#    No csr => AWS generated the keypair (it is in SSM for the firmware build).
+#
+#    INACTIVE by default: the claim is extractable from any image or device, so
+#    it only works while a device is being enrolled. Open an enrolment window
+#    with scripts/claim-window.sh (it re-activates the claim for a limited time);
+#    the next apply also closes it. Provisioned devices use their own
+#    certificates and never need the claim.
 # ---------------------------------------------------------------------------
 resource "aws_iot_certificate" "claim" {
-  active = true
+  active = var.claim_active
 }
 
 resource "aws_iot_policy" "claim" {
@@ -30,10 +36,13 @@ resource "aws_iot_policy" "claim" {
     Version = "2012-10-17"
     Statement = [
       {
+        # Firmware connects as claim-<MAC12> while enrolling. Restricting the
+        # claim to that prefix keeps a claim holder from taking over a device's
+        # client id (AWS IoT drops the older session on a duplicate id).
         Sid      = "Connect"
         Effect   = "Allow"
         Action   = "iot:Connect"
-        Resource = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/*"
+        Resource = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/claim-*"
       },
       {
         Sid      = "CreateKeysAndCertificate"
@@ -129,9 +138,11 @@ resource "aws_iot_policy" "device" {
 
 # ---------------------------------------------------------------------------
 # 3) OTA thing groups, one pair per product.
-#    Every OTA job of a product targets its FLEET group. CANARY is a child of
-#    it, so canary devices are part of every fleet job too; it marks the bench
-#    units a canary-first rollout would update first. AWS IoT allows a thing in
+#    A release's OTA job targets the product's CANARY group (the ota_trigger
+#    Lambda); scripts/promote.sh then creates the job for the FLEET group once
+#    the canaries succeeded. CANARY is a child of FLEET, so canary devices are
+#    part of every fleet job too (they already run the version and settle it
+#    without a download). AWS IoT allows a thing in
 #    only one group of a hierarchy, which keeps the two sets disjoint. The
 #    products' hierarchies are separate, so a job never crosses products.
 #    New devices join their product's fleet group through its provisioning
@@ -142,7 +153,7 @@ resource "aws_iot_thing_group" "fleet" {
   name     = each.value.fleet_group_name
 
   properties {
-    description = "All provisioned ${each.value.description} devices. OTA jobs for product '${each.key}' target this group."
+    description = "All provisioned ${each.value.description} devices. Promoted OTA jobs for product '${each.key}' target this group."
   }
 }
 
@@ -152,7 +163,7 @@ resource "aws_iot_thing_group" "canary" {
   parent_group_name = aws_iot_thing_group.fleet[each.key].name
 
   properties {
-    description = "Bench and test ${each.value.description} devices. A child of the fleet group, so they receive every fleet OTA job."
+    description = "Bench and test ${each.value.description} devices. Every release's OTA job targets this group first; a child of the fleet group."
   }
 }
 
@@ -272,7 +283,9 @@ moved {
 
 # ---------------------------------------------------------------------------
 # 5) (Optional) Simple IoT Rule to route telemetry to CloudWatch Logs.
-#    Useful to see that the device actually publishes in PoC.
+#    Useful to see that the device actually publishes. OFF by default: every
+#    message would be billed as a rule, an action and Logs ingestion. Turn it on
+#    for a debugging session or a HIL run with -var debug_telemetry_logs=true.
 # ---------------------------------------------------------------------------
 resource "aws_cloudwatch_log_group" "telemetry" {
   name              = "/${var.project_name}/telemetry"
@@ -312,7 +325,7 @@ resource "aws_iam_role_policy" "iot_rule" {
 
 resource "aws_iot_topic_rule" "telemetry_to_logs" {
   name        = replace("${var.project_name}_telemetry_to_logs", "-", "_")
-  enabled     = true
+  enabled     = var.debug_telemetry_logs
   sql         = "SELECT *, topic() AS topic, timestamp() AS ts FROM '${var.telemetry_topic_prefix}/+/data'"
   sql_version = "2016-03-23"
 
@@ -337,7 +350,7 @@ resource "aws_cloudwatch_log_group" "opcua_telemetry" {
 
 resource "aws_iot_topic_rule" "opcua_telemetry_to_logs" {
   name        = replace("${var.project_name}_opcua_telemetry_to_logs", "-", "_")
-  enabled     = true
+  enabled     = var.debug_telemetry_logs
   sql         = "SELECT *, topic() AS topic, timestamp() AS ts FROM '${var.telemetry_topic_prefix}/+/opcua'"
   sql_version = "2016-03-23"
 

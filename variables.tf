@@ -13,7 +13,19 @@ variable "project_name" {
 variable "log_retention_days" {
   description = "CloudWatch log retention period (kept low for cost reasons)."
   type        = number
-  default     = 7
+  default     = 3
+}
+
+variable "claim_active" {
+  description = "Whether the shared claim certificate is ACTIVE. Keep false: scripts/claim-window.sh opens a timed enrolment window instead."
+  type        = bool
+  default     = false
+}
+
+variable "debug_telemetry_logs" {
+  description = "Route device telemetry (dt/+/data, dt/+/opcua) to CloudWatch Logs. Costs per message; enable only while debugging or for a gateway HIL run."
+  type        = bool
+  default     = false
 }
 
 variable "telemetry_topic_prefix" {
@@ -184,9 +196,9 @@ variable "ota_abort_failure_percentage" {
 }
 
 variable "ota_abort_min_executed_things" {
-  description = "The abort percentage is only applied once this many devices have been notified of the job, so the first few results cannot cancel a release on their own."
+  description = "The abort percentage is only applied once this many devices have been notified of the job. 1: with a handful of devices, the first failure on a canary stops the release."
   type        = number
-  default     = 10
+  default     = 1
 
   validation {
     condition     = floor(var.ota_abort_min_executed_things) == var.ota_abort_min_executed_things && var.ota_abort_min_executed_things >= 1

@@ -97,14 +97,16 @@ sequenceDiagram
 A device with a secure element (Vaktus) calls `CreateCertificateFromCsr` (`$aws/certificates/create-from-csr/json`) instead of `CreateKeysAndCertificate`: it sends a CSR signed inside its ATECC608B and receives a certificate for that key, so no private key crosses the wire.
 
 ### Security Model
-*   **Claim Policy**: Restricts devices to connect and publish/subscribe *only* on provisioning topics (`$aws/certificates/create/*`, `$aws/certificates/create-from-csr/*` and each product's `$aws/provisioning-templates/<template>/provision/*`). It prevents devices from publishing telemetry or accessing other IoT resources. The claim certificate is shared by all products; what each product may enrol as is decided by the hook.
+*   **Claim certificate is INACTIVE** outside enrolment windows (`var.claim_active = false`). It is extractable from any firmware image or device, so it only works while you enrol a device: `scripts/claim-window.sh [minutes]` activates it and deactivates it again when the time is up or on Ctrl-C (see [Enrolling a Device](#enrolling-a-device)). Provisioned devices use their own certificates and never need it.
+*   **Claim Policy**: Allows connecting only as `claim-*` client ids (the firmware uses `claim-<MAC12>`), so a claim holder cannot take over a device's client id. Restricts devices to publish/subscribe *only* on provisioning topics (`$aws/certificates/create/*`, `$aws/certificates/create-from-csr/*` and each product's `$aws/provisioning-templates/<template>/provision/*`). It prevents devices from publishing telemetry or accessing other IoT resources. The claim certificate is shared by all products; what each product may enrol as is decided by the hook.
 *   **Device Policy**: Dynamically restricts each provisioned device using policy variables. Devices can only connect if their `ClientId` matches their `ThingName`. They are restricted to publish to `dt/${iot:Connection.Thing.ThingName}/*` and subscribe to `cmd/${iot:Connection.Thing.ThingName}/*`.
 *   **Lambda Hook** ([lambda/pre_provisioning_hook](lambda/pre_provisioning_hook/main.go)) fails closed. It rejects the request unless every check passes:
     1. The template is one of the products' templates (from `templateArn`).
-    2. The device's MAC is in DynamoDB with `allowed = true`.
+    2. The device's MAC (normalised to `AA:BB:CC:DD:EE:FF`, whatever spelling the device sends) is in DynamoDB with `allowed = true`, **not yet `provisioned`**, and, if the record has `enrol_by`, before that time.
     3. The record's `product` is the template's product. A record without `product` was written before products existed and belongs to the legacy product (`gateway`).
     4. **If the record has a `public_key`, or the product sets `require_public_key`** (Vaktus): the certificate being provisioned (`certificatePem`) must carry exactly that key. A leaked claim credential or shared secret is not enough: only the chip holding the registered key can enrol. The secret is not consulted.
     5. **Otherwise** (gateway): the `Secret` parameter must match the record's `secret` (constant-time comparison).
+    6. It then marks the record `provisioned` with a conditional write. A record enrols **once**: a second request (a clone using the public gateway secret, or a race) is rejected, and so is a request whose enrolment could not be recorded.
 
 ### Device Registry Records
 
@@ -115,9 +117,10 @@ The table is keyed by `mac_address` (`AA:BB:CC:DD:EE:FF`, upper case):
 | `mac_address` | S | Hash key |
 | `product` | S | Product id the device may enrol as. Missing: the legacy product (`gateway`) |
 | `allowed` | BOOL | `false` blocks (re-)enrolment |
+| `enrol_by` | N | Optional. Unix seconds after which the record no longer enrols |
 | `public_key` | S | The device's public key: the 128 hex digits of X‖Y an ATECC608 GenKey returns, the same with a `04` prefix (colons allowed), or a PEM `PUBLIC KEY` block. Required for Vaktus |
 | `secret` | S | Shared secret for products without a secure element |
-| `provisioned`, `last_provisioned_serial`, `last_certificate_id`, `last_provisioned_via` | | Written by the hook on approval |
+| `provisioned`, `last_provisioned_serial`, `last_certificate_id`, `last_provisioned_via`, `last_provisioned_at` | | Written by the hook on approval. `provisioned = true` blocks any further enrolment |
 
 A Vaktus record:
 ```sh
@@ -132,11 +135,18 @@ aws dynamodb put-item --table-name esp32-ztp-device-registry --item '{
 
 Write access to this table is effectively the right to enrol a device: keep it to administrators.
 
+### Enrolling a Device
+
+1. Register it: write its record with `provisioned = false` (the `put-item` above, or the gateway repo's `seed-device`).
+2. Open a window and power the device: `scripts/claim-window.sh 30`. The device enrols within a couple of minutes; the window closes itself (on time, on Ctrl-C, or when the shell exits). The script is the only thing that closes it: if the laptop dies mid-window, run `aws iot update-certificate --new-status INACTIVE` on the claim, or `terraform apply`. Setting `enrol_by` on the record (Unix seconds, e.g. `$(( $(date +%s) + 3600 ))`) bounds the record's own window server-side.
+
+To **re-enrol** a device (a new key, erased NVS), register it again: writing the record with `provisioned = false` is what allows one more enrolment. Its old certificate stays attached to the thing until you deactivate it.
+
 ---
 
 ## 3. Firmware Release & OTA Flow
 
-The platform provides automatic, event-driven rolling OTA updates triggered when a new firmware binary is uploaded to Amazon S3. Each upload becomes one AWS IoT Job for **its product's fleet thing group**, rolled out in stages and stopped automatically when too many devices fail.
+The platform provides automatic, event-driven OTA updates triggered when a new firmware binary is uploaded to Amazon S3. Each upload becomes one AWS IoT Job for **its product's canary thing group**, stopped automatically when a canary fails. Once the canaries succeeded, `scripts/promote.sh <product>` creates the same job for the product's **fleet** group (the canaries are part of it too and settle without a download). The promote step becomes automatic in a later phase of the platform plan.
 
 ### Firmware Keys and Routing
 
@@ -167,8 +177,8 @@ sequenceDiagram
     OIDC-->>GitHub: Temporary AWS credentials
     GitHub->>S3: Upload firmware.bin (key: <product>/firmware_vX.Y.Z.bin)
     S3->>Lambda: Trigger s3:ObjectCreated notification
-    Lambda->>IoT: Create CONTINUOUS job for the product's fleet thing group<br/>(rollout, abort, timeout & presigned-URL config)
-    Lambda->>IoT: Cancel that group's older ota-* jobs
+    Lambda->>IoT: Create CONTINUOUS job for the product's canary thing group<br/>(rollout, abort, timeout & presigned-URL config)
+    Lambda->>IoT: Cancel the product's older ota-* jobs (canary and fleet)
     Note over IoT: Notify devices at the rollout rate,<br/>faster as executions succeed
     IoT-->>Device: Notify via $aws/things/{thingName}/jobs/notify-next
     Device->>IoT: Request job details via $aws/things/{thingName}/jobs/$next/get
@@ -190,12 +200,12 @@ The firmware currently reports SUCCEEDED right after the download, before it reb
 
 ### Thing Groups
 
-| Product | Fleet group (OTA target) | Canary group (child of fleet) | Provisioning template |
+| Product | Fleet group (`promote.sh` target) | Canary group (child of fleet; release target) | Provisioning template |
 | :--- | :--- | :--- | :--- |
 | `gateway` | `esp32-ztp-fleet` | `esp32-ztp-canary` (bench unit `28848553144F`) | `esp32-s3-fleet-template` |
 | `vaktus` | `esp32-ztp-vaktus-fleet` | `esp32-ztp-vaktus-canary` (bench unit `38182B8456F4`) | `esp32-ztp-vaktus-fleet-template` |
 
-The gateway keeps the names it had before products existed (pinned in `products.gateway`); new products get `esp32-ztp-<id>-…` names. A product's template puts every device it registers into the product's fleet group and sets the thing attribute `product`. The canary group receives every fleet job too, and marks the devices a canary-first rollout would update first.
+The gateway keeps the names it had before products existed (pinned in `products.gateway`); new products get `esp32-ztp-<id>-…` names. A product's template puts every device it registers into the product's fleet group and sets the thing attribute `product`. Every release goes to the canary group first; the canary group also receives every promoted fleet job.
 
 AWS IoT allows a thing in only one group of a hierarchy. A device provisioned since its fleet group existed is already in it, so to make it a canary, remove it from the fleet group first, then add it to `products.<id>.canary_things` and apply:
 ```sh
@@ -212,14 +222,14 @@ If a device provisions again, the template leaves its group membership as it is.
 | ... each time this many more devices succeed | `ota_rollout_succeeded_things` | 5 |
 | ... up to | `ota_rollout_max_per_minute` | 20 devices per minute |
 | Cancel the job when this share of executions ended FAILED, TIMED_OUT or REJECTED | `ota_abort_failure_percentage` | 20 % |
-| ... counted once this many devices have been notified | `ota_abort_min_executed_things` | 10 |
+| ... counted once this many devices have been notified | `ota_abort_min_executed_things` | 1 (a single failed canary stops the release) |
 | An execution still IN_PROGRESS after this becomes TIMED_OUT | `ota_in_progress_timeout_minutes` | 30 minutes |
 
 Terraform validates these against the ranges the AWS IoT API accepts, and passes them to the Lambda as environment variables. The Lambda checks them again and refuses to start if any is missing or invalid, rather than create a job without its brakes. `aws iot describe-job --job-id <id>` shows the configuration of a created job.
 
 ### One Release in Flight
 
-The job is **CONTINUOUS**, so a device that joins the fleet group later still receives it. A continuous job never completes, though, and a device that joined would receive every older release still active, oldest first. So after creating its job, the Lambda cancels the older `ota-*` jobs of the same product's group (jobs from before products, `ota-firmware_v…`, included); other products' groups are never touched. It does not force the cancellation: queued executions are dropped, while a device already mid-update finishes and then takes the new job.
+The job is **CONTINUOUS**, so a device that joins the group later still receives it. A continuous job never completes, though, and a device that joined would receive every older release still active, oldest first. So after creating its job, the Lambda cancels the older `ota-*` jobs that target the same product's canary group. Listing a child group's jobs also returns the jobs aimed at its parent; the Lambda reads each job's targets and leaves those fleet jobs alone, so the fleet keeps its last promoted release (for devices that join or come back online) until `promote.sh` replaces it. `promote.sh` cancels the product's older fleet jobs. Other products' groups are never touched. It does not force the cancellation: queued executions are dropped, while a device already mid-update finishes and then takes the new job.
 
 The job ID is `ota-<product>-<version>-<upload time in ms>`, taken from the S3 event rather than the clock. A redelivered or retried event therefore maps to the job it already created, and "older" means an earlier upload even when invocations run out of order. A failed invocation returns an error, so Lambda retries it; the retry finds the job and finishes the cancellation. Uploading the same file again is a new upload: it creates a new job, which the whole group receives again.
 
@@ -232,7 +242,7 @@ The job document keeps its fields (`operation`, `firmware_version`, `download_ur
 ## 4. Setup & Deployment Guide
 
 ### Prerequisites
-*   Terraform `>= 1.5.0`
+*   Terraform `>= 1.10` (the S3 backend uses `use_lockfile`; CI pins 1.17.1)
 *   AWS CLI `v2`
 *   Go `>= 1.22` (required to compile Go Lambda binaries during Terraform runs)
 
@@ -313,7 +323,9 @@ All resources deployed in this repository are serverless and billed purely on-de
 | **DynamoDB** | PAY_PER_REQUEST (On-Demand) | Billed per read/write; free tier covers PoC |
 | **AWS Lambda** | per invocation & duration | Billed per millisecond; free tier covers PoC |
 | **Amazon S3** | per GB-month & requests | Storage cost for binaries is fractions of a cent |
-| **CloudWatch Logs** | per GB ingested/stored | Kept low via a 7-day retention period |
+| **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; telemetry routing off by default |
+
+Telemetry is not routed to CloudWatch Logs by default (`debug_telemetry_logs = false`): every message would be billed as a rule, an action and Logs ingestion. Turn it on for a debugging session or a gateway HIL run (`terraform apply -var debug_telemetry_logs=true`), and off again afterwards.
 
 ### Teardown
 To destroy all Terraform-managed resources:

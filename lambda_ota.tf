@@ -55,18 +55,21 @@ resource "aws_iam_role_policy" "ota_trigger" {
       },
       {
         # CreateJob is authorised against the job being created AND every
-        # target; the targets are the products' fleet thing groups.
+        # target; a release targets its product's canary group (fleet jobs are
+        # created by scripts/promote.sh under the owner's credentials).
         Effect = "Allow"
         Action = "iot:CreateJob"
         Resource = concat(
           ["${local.iot_arn}:job/ota-*"],
-          [for g in aws_iot_thing_group.fleet : g.arn],
+          [for g in aws_iot_thing_group.canary : g.arn],
         )
       },
       {
-        # A new release cancels the older OTA jobs of its product's group.
+        # A new release cancels the older OTA jobs of its product's group; it
+        # reads each listed job's targets first, so jobs aimed at the parent
+        # fleet group (listed through the canary group) are left alone.
         Effect   = "Allow"
-        Action   = "iot:CancelJob"
+        Action   = ["iot:CancelJob", "iot:DescribeJob"]
         Resource = "${local.iot_arn}:job/ota-*"
       },
       {
@@ -123,10 +126,16 @@ resource "aws_iam_role_policy" "ota_presign" {
   role = aws_iam_role.ota_presign.id
   policy = jsonencode({
     Version = "2012-10-17"
+    # Only firmware images: <product>/firmware_v*.bin, the legacy root
+    # firmware_v*.bin, and manual/ for single-device bench jobs.
     Statement = [{
-      Effect   = "Allow"
-      Action   = "s3:GetObject"
-      Resource = "${aws_s3_bucket.firmware.arn}/*"
+      Effect = "Allow"
+      Action = "s3:GetObject"
+      Resource = [
+        "${aws_s3_bucket.firmware.arn}/firmware_v*.bin",
+        "${aws_s3_bucket.firmware.arn}/*/firmware_v*.bin",
+        "${aws_s3_bucket.firmware.arn}/manual/*",
+      ]
     }]
   })
 }
@@ -147,9 +156,10 @@ resource "aws_lambda_function" "ota_trigger" {
   environment {
     variables = {
       S3_BUCKET_NAME = aws_s3_bucket.firmware.bucket
-      # Product id -> fleet thing group. An upload under <id>/ becomes a job for
-      # that group only; anything else is ignored.
-      OTA_PRODUCT_GROUPS = jsonencode({ for id, g in aws_iot_thing_group.fleet : id => g.arn })
+      # Product id -> CANARY thing group. An upload under <id>/ becomes a job for
+      # the product's canary devices only; scripts/promote.sh takes a release
+      # that succeeded there to the fleet. Anything else is ignored.
+      OTA_PRODUCT_GROUPS = jsonencode({ for id, g in aws_iot_thing_group.canary : id => g.arn })
       # Uploads at the bucket root belong to this product ("" = ignore them).
       OTA_LEGACY_ROOT_PRODUCT          = local.legacy_product == null ? "" : local.legacy_product
       OTA_PRESIGN_ROLE_ARN             = aws_iam_role.ota_presign.arn
