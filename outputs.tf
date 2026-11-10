@@ -39,3 +39,8 @@ output "canary_thing_groups" {
 # Amazon Root CA 1:
 #   curl -s https://www.amazontrust.com/repository/AmazonRootCA1.pem \
 #     > ../certs/AmazonRootCA1.pem
+
+output "guard_topic_arn" {
+  description = "SNS topic of the guard alarms and budgets (email + kill switch)."
+  value       = aws_sns_topic.guard.arn
+}

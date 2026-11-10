@@ -216,3 +216,52 @@ variable "ota_in_progress_timeout_minutes" {
     error_message = "Must be an integer from 1 to 10080 (7 days)."
   }
 }
+
+# ---------------------------------------------------------------------------
+# Guard rails (guard.tf). Thresholds sit 20x or more above the measured
+# baseline: at most 48 publishes and 4 connects per 5 minutes (Nov 2026).
+# ---------------------------------------------------------------------------
+variable "alert_email" {
+  description = "Email for guard alarms, kill-switch trips and budget warnings. Required: the kill switch can take the fleet offline and must never do so silently. Set it in terraform.tfvars (gitignored); AWS sends a confirmation mail whose link must be clicked."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$", var.alert_email))
+    error_message = "Must be an email address."
+  }
+}
+
+variable "guard_publish_per_5min" {
+  description = "Fleet-wide IoT publishes per 5 minutes above which the traffic scope trips; 6 periods in a row trip the fleet scope. It counts messages, not bytes: 1,000 small messages per 5 min is about $10 a month if sustained, but AWS bills per 5 KB, so a flood of large messages just under the threshold is only stopped by the budgets."
+  type        = number
+  default     = 1000
+}
+
+variable "guard_connect_per_5min" {
+  description = "Fleet-wide IoT connects per 5 minutes above which the provisioning scope trips."
+  type        = number
+  default     = 30
+}
+
+variable "guard_hook_per_5min" {
+  description = "Pre-provisioning hook invocations per 5 minutes above which the provisioning scope trips."
+  type        = number
+  default     = 10
+}
+
+variable "guard_budget_traffic_usd" {
+  description = "Monthly cost (USD) at which the traffic scope trips. Email warnings at 50 % actual and 100 % forecast."
+  type        = number
+  default     = 10
+}
+
+variable "guard_budget_fleet_usd" {
+  description = "Monthly cost (USD) at which the fleet scope trips: every device is cut off."
+  type        = number
+  default     = 25
+
+  validation {
+    condition     = var.guard_budget_fleet_usd > var.guard_budget_traffic_usd
+    error_message = "Must be above guard_budget_traffic_usd: the fleet scope is the last resort."
+  }
+}

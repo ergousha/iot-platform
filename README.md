@@ -247,11 +247,26 @@ The job document keeps its fields (`operation`, `firmware_version`, `download_ur
 *   Go `>= 1.22` (required to compile Go Lambda binaries during Terraform runs)
 
 ### AWS Authentication Configuration
-Configure your local environment with credentials for your target AWS account:
+No long-lived admin credentials exist. The one IAM user's access key lives in the macOS keychain ([aws-vault](https://github.com/99designs/aws-vault)), and on its own it can only read the firmware build parameters in SSM and assume an admin role, which requires MFA:
+
+```ini
+# ~/.aws/config
+[profile ergin]
+region = eu-central-1
+
+[profile ergousha-admin]
+source_profile = ergin
+role_arn       = arn:aws:iam::<account>:role/owner-admin
+mfa_serial     = arn:aws:iam::<account>:mfa/<device>
+duration_seconds = 43200
+region = eu-central-1
+```
+
 ```sh
-aws configure --profile esp32-ztp
-export AWS_PROFILE=esp32-ztp
-aws sts get-caller-identity
+aws-vault add ergin                                     # once: stores the key in the keychain
+aws-vault exec ergousha-admin -- terraform apply        # asks for the MFA code, 12-hour session
+aws-vault exec ergousha-admin -- scripts/promote.sh vaktus
+aws-vault exec ergin -- cargo build --release           # firmware builds only read SSM
 ```
 
 ### Terraform Deployment
@@ -312,7 +327,54 @@ Each product has its own role, trusted only by its repository's `main` branch ([
 
 ---
 
-## 5. Project Costs & Teardown
+## 5. Guard Rails (Cost Protection)
+
+Denial-of-wallet is the main threat to a self-funded platform. [guard.tf](guard.tf) wires free CloudWatch alarms and two budgets to the SNS topic `esp32-ztp-guard`. The topic emails `alert_email` (required: set it in `terraform.tfvars`, then click the link in AWS's confirmation mail) and invokes the kill switch ([lambda/kill_switch](lambda/kill_switch/main.go)).
+
+| Alarm / budget | Trips when | Scope |
+| :--- | :--- | :--- |
+| `esp32-ztp-guard-publish-5m` | IoT publishes (MQTT + HTTPS) > `guard_publish_per_5min` (1,000) in 5 min | traffic |
+| `esp32-ztp-guard-publish-30m` | the same for 30 min in a row | fleet |
+| `esp32-ztp-guard-connect-5m` | IoT connects > `guard_connect_per_5min` (30) in 5 min | provisioning |
+| `esp32-ztp-guard-hook-5m` | hook invocations > `guard_hook_per_5min` (10) in 5 min | provisioning |
+| `esp32-ztp-guard-ota-errors`, `-kill-switch-errors` | a Lambda failed | email only |
+| budget `esp32-ztp-guard-traffic` | actual cost > $10 this month, again at $15 (email at $5 actual and $10 forecast) | traffic |
+| budget `esp32-ztp-guard-fleet` | actual cost > $25 this month, again at $37.50 | fleet |
+
+The measured baseline was at most 48 publishes and 4 connects per 5 minutes. Each scope includes the ones above it:
+
+* **provisioning**: the claim certificate goes INACTIVE.
+* **traffic**: the telemetry → CloudWatch Logs rules are disabled.
+* **fleet**: the deny-all policy `esp32-ztp-guard-deny-all` is attached to every fleet group. Every device is refused on its next publish or connect, so the fleet goes offline and messaging cost stops.
+
+Every trip is recorded in the SSM parameter `/esp32-ztp/guard/state`. `claim-window.sh` refuses to open a window while it is tripped. Once you know why it tripped:
+
+```sh
+aws ssm get-parameter --name /esp32-ztp/guard/state --query Parameter.Value --output text
+scripts/guard-reset.sh      # detaches deny-all from the fleet groups, clears the state
+terraform apply             # restores the rules to their configured value
+```
+
+To cut off a **single** device, add it to the quarantine group, which carries the deny-all policy permanently (Device Defender, which could do this automatically, is no longer offered to new customers):
+
+```sh
+aws iot add-thing-to-thing-group --thing-name <thing> --thing-group-name esp32-ztp-quarantine
+```
+
+To test the wiring, set the hook alarm by hand (provisioning scope: it only re-asserts the INACTIVE claim). The alarm returns to its real state at the next evaluation, but the kill switch records a **real trip**, so finish with a reset:
+
+```sh
+aws cloudwatch set-alarm-state --alarm-name esp32-ztp-guard-hook-5m --state-value ALARM --state-reason test
+scripts/guard-reset.sh --yes
+```
+
+Do not test with the publish alarms unless you mean it: `publish-30m` cuts off the whole fleet.
+
+Budget notifications lag the spend by hours, so the alarms are the first line and the budgets the backstop. An ACTUAL budget alert fires once per month, so each budget alerts the kill switch again at 150 % (`guard-reset.sh` warns when a budget is already over its limit). The publish alarms count messages, not bytes: AWS bills per 5 KB, so a flood of large messages just under the threshold is bounded only by the budgets. AWS Cost Anomaly Detection (its default services monitor, daily email) is on as well. The Lambda account concurrency limit stays at its default of 10: at most 10 Lambda invocations run at once, whatever triggers them, which caps Lambda cost for free.
+
+---
+
+## 6. Project Costs & Teardown
 
 ### Cost Breakdown
 All resources deployed in this repository are serverless and billed purely on-demand, costing **~$0.00 USD/month when idle**:
@@ -320,10 +382,11 @@ All resources deployed in this repository are serverless and billed purely on-de
 | Service | Billing Model | PoC Cost |
 | :--- | :--- | :--- |
 | **IoT Core** | per connectivity-minute & message | Negligible for PoC connections |
-| **DynamoDB** | PAY_PER_REQUEST (On-Demand) | Billed per read/write; free tier covers PoC |
+| **DynamoDB** | PAY_PER_REQUEST (On-Demand), capped at 2 reads and 2 writes per second; PITR on | Billed per request (a few a month); PITR about $0.000001 a month |
 | **AWS Lambda** | per invocation & duration | Billed per millisecond; free tier covers PoC |
 | **Amazon S3** | per GB-month & requests | Storage cost for binaries is fractions of a cent |
 | **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; telemetry routing off by default |
+| **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: 8 of the 10 free alarm metrics, a handful of messages, budgets without actions |
 
 Telemetry is not routed to CloudWatch Logs by default (`debug_telemetry_logs = false`): every message would be billed as a rule, an action and Logs ingestion. Turn it on for a debugging session or a gateway HIL run (`terraform apply -var debug_telemetry_logs=true`), and off again afterwards.
 
