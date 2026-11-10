@@ -10,7 +10,8 @@
 # then run this and power the device: it enrols with the claim within a minute
 # or two and from then on uses its own certificate.
 #
-# Uses the caller's AWS credentials (the owner's), not anything in the repo.
+# Uses the caller's AWS credentials (the owner's), not anything in the repo,
+# and jq.
 set -euo pipefail
 
 minutes="${1:-30}"
@@ -21,6 +22,15 @@ if ! [[ "$minutes" =~ ^[1-9][0-9]{0,2}$ ]] || ((minutes > 120)); then
 fi
 
 policy="${CLAIM_POLICY:-esp32-ztp-claim-policy}"
+
+# Never open a window while the kill switch has tripped: something is abusing
+# the platform. scripts/guard-reset.sh clears the trip once it is understood.
+state=$(aws ssm get-parameter --name "${GUARD_STATE_PARAMETER:-/esp32-ztp/guard/state}" --query Parameter.Value --output text)
+if [[ "$(jq -r '.tripped' <<<"$state")" != false ]]; then
+  echo "refusing: the guard is tripped: $state" >&2
+  echo "investigate, then run scripts/guard-reset.sh" >&2
+  exit 1
+fi
 
 # The claim certificate is the one target of the claim policy.
 targets=$(aws iot list-targets-for-policy --policy-name "$policy" --query 'targets' --output text)
