@@ -25,26 +25,3 @@ resource "aws_dynamodb_table" "device_registry" {
     Name = "${var.project_name}-device-registry"
   }
 }
-
-# Example device record.
-# Note: replace the mac_address with your ESP32's actual MAC address
-# (the firmware logs it on boot; or use scripts/seed_device.py).
-# A seed script can be preferred instead of leaving this open; an example
-# is kept here for PoC convenience.
-resource "aws_dynamodb_table_item" "sample_device" {
-  table_name = aws_dynamodb_table.device_registry.name
-  hash_key   = aws_dynamodb_table.device_registry.hash_key
-
-  item = jsonencode({
-    mac_address = { S = "AA:BB:CC:DD:EE:FF" }
-    secret      = { S = "change-me-shared-secret" }
-    allowed     = { BOOL = true }
-    provisioned = { BOOL = false }
-    note        = { S = "terraform example record - replace with actual device" }
-  })
-
-  lifecycle {
-    # Lambda updates the 'provisioned' field; prevent terraform from overwriting it.
-    ignore_changes = [item]
-  }
-}

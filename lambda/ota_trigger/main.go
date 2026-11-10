@@ -39,6 +39,7 @@ type IoTAPI interface {
 	CreateJob(ctx context.Context, params *iot.CreateJobInput, optFns ...func(*iot.Options)) (*iot.CreateJobOutput, error)
 	ListJobs(ctx context.Context, params *iot.ListJobsInput, optFns ...func(*iot.Options)) (*iot.ListJobsOutput, error)
 	CancelJob(ctx context.Context, params *iot.CancelJobInput, optFns ...func(*iot.Options)) (*iot.CancelJobOutput, error)
+	DescribeJob(ctx context.Context, params *iot.DescribeJobInput, optFns ...func(*iot.Options)) (*iot.DescribeJobOutput, error)
 }
 
 // productIDPattern is what Terraform accepts as a product id.
@@ -359,6 +360,12 @@ func (a *App) createJobInput(product string, group ProductGroup, jobID, version,
 // out-of-order invocations converge on the same survivor; if a newer job is
 // already active, jobID itself is the one cancelled. created says whether this
 // invocation created jobID. It returns the surviving job's ID.
+//
+// Only jobs that TARGET this group compete. Listing a child group's jobs also
+// returns the jobs aimed at its parent: the product's canary group lists the
+// fleet jobs scripts/promote.sh created. Those keep serving the fleet (devices
+// that join it, or come back online) until the next promotion replaces them, so
+// a new canary release must not cancel them.
 func (a *App) cancelSupersededJobs(ctx context.Context, group ProductGroup, jobID string, created bool) (string, error) {
 	var active []string
 	ownActive := created
@@ -384,6 +391,13 @@ func (a *App) cancelSupersededJobs(ctx context.Context, group ProductGroup, jobI
 			if _, ok := jobTimestamp(id); !ok {
 				slog.Warn("Leaving ota- job without an upload timestamp alone", "jobID", id)
 				continue
+			}
+			targetsGroup, err := a.jobTargets(ctx, id, group.ARN)
+			if err != nil {
+				return "", err
+			}
+			if !targetsGroup {
+				continue // e.g. a promoted fleet job, listed through the parent group
 			}
 			active = append(active, id)
 		}
@@ -416,6 +430,28 @@ func (a *App) cancelSupersededJobs(ctx context.Context, group ProductGroup, jobI
 		slog.Info("Cancelled superseded job", "jobID", id, "supersededBy", newest)
 	}
 	return newest, errors.Join(errs...)
+}
+
+// jobTargets reports whether job id targets groupARN directly. A job that was
+// deleted since it was listed targets nothing.
+func (a *App) jobTargets(ctx context.Context, id, groupARN string) (bool, error) {
+	out, err := a.iotClient.DescribeJob(ctx, &iot.DescribeJobInput{JobId: aws.String(id)})
+	if err != nil {
+		var gone *types.ResourceNotFoundException
+		if errors.As(err, &gone) {
+			return false, nil
+		}
+		return false, fmt.Errorf("describing job %s: %w", id, err)
+	}
+	if out.Job == nil {
+		return false, nil
+	}
+	for _, t := range out.Job.Targets {
+		if t == groupARN {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Handler turns a firmware upload into an OTA job for its product's thing

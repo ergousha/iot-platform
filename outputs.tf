@@ -9,7 +9,7 @@ output "provisioning_template_names" {
 }
 
 output "fleet_thing_groups" {
-  description = "Fleet thing group of each product: the target of its OTA jobs."
+  description = "Fleet thing group of each product: the target of the jobs scripts/promote.sh creates."
   value       = { for id, g in aws_iot_thing_group.fleet : id => g.name }
 }
 
@@ -27,30 +27,15 @@ output "firmware_bucket_name" {
   value       = aws_s3_bucket.firmware.id
 }
 
-output "claim_certificate_pem" {
-  description = "CLAIM certificate to be flashed to device (certs/claim.crt.pem)."
-  value       = aws_iot_certificate.claim.certificate_pem
-  sensitive   = true
+output "canary_thing_groups" {
+  description = "Canary thing group of each product: the target of the OTA job every release creates."
+  value       = { for id, g in aws_iot_thing_group.canary : id => g.name }
 }
 
-output "claim_private_key" {
-  description = "CLAIM private key to be flashed to device (certs/claim.private.key)."
-  value       = aws_iot_certificate.claim.private_key
-  sensitive   = true
-}
-
-output "claim_public_key" {
-  value     = aws_iot_certificate.claim.public_key
-  sensitive = true
-}
-
-# ---------------------------------------------------------------------------
-# To extract certificates to files (not printed to screen because they are sensitive):
-#
-#   terraform output -raw claim_certificate_pem > ../certs/claim.crt.pem
-#   terraform output -raw claim_private_key     > ../certs/claim.private.key
+# The claim certificate and key are deliberately not outputs: they are in SSM
+# (/esp32-ztp/poc/claim_certificate_pem, /esp32-ztp/poc/claim_private_key),
+# where the firmware build reads them.
 #
 # Amazon Root CA 1:
 #   curl -s https://www.amazontrust.com/repository/AmazonRootCA1.pem \
 #     > ../certs/AmazonRootCA1.pem
-# ---------------------------------------------------------------------------

@@ -11,10 +11,12 @@ import (
 	"encoding/pem"
 	"errors"
 	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
@@ -108,8 +110,24 @@ func record(attrs map[string]types.AttributeValue) func(ctx context.Context, par
 	}
 }
 
+// fixedNow is the handler's clock in tests.
+var fixedNow = time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+
 func s(v string) types.AttributeValue { return &types.AttributeValueMemberS{Value: v} }
-func b(v bool) types.AttributeValue   { return &types.AttributeValueMemberBOOL{Value: v} }
+func n(v int64) types.AttributeValue {
+	return &types.AttributeValueMemberN{Value: strconv.FormatInt(v, 10)}
+}
+
+// lookupMust returns the record only when it is looked up by exactly mac.
+func lookupMust(mac string, attrs map[string]types.AttributeValue) func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+	return func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
+		if params.Key["mac_address"].(*types.AttributeValueMemberS).Value != mac {
+			return &dynamodb.GetItemOutput{}, nil
+		}
+		return &dynamodb.GetItemOutput{Item: attrs}, nil
+	}
+}
+func b(v bool) types.AttributeValue { return &types.AttributeValueMemberBOOL{Value: v} }
 func colons(hexKey string) string {
 	var parts []string
 	for i := 0; i < len(hexKey); i += 2 {
@@ -135,13 +153,14 @@ func TestHandler(t *testing.T) {
 	vaktusParams := map[string]string{"MacAddress": testMAC, "SerialNumber": "38182B8456F4"}
 
 	tests := []struct {
-		name           string
-		event          PreProvisioningEvent
-		getItemFunc    func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
-		updateItemFunc func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
-		wantAllow      bool
-		wantVia        string // last_provisioned_via written on approval
-		wantNoLookup   bool
+		name            string
+		event           PreProvisioningEvent
+		getItemFunc     func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
+		updateItemFunc  func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
+		wantAllow       bool
+		wantVia         string // last_provisioned_via written on approval
+		wantNoLookup    bool
+		wantUpdateTried bool // rejected, but only after trying to record the enrolment
 	}{
 		// --- Secret-based products (the gateway) ---
 		{
@@ -159,14 +178,84 @@ func TestHandler(t *testing.T) {
 			wantVia:     "secret",
 		},
 		{
-			name:        "Gateway - approved even if the DynamoDB update fails (best effort)",
+			name:        "Rejected - the enrolment cannot be recorded (fail closed)",
 			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
 			getItemFunc: record(legacyGateway),
 			updateItemFunc: func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
 				return nil, errors.New("database update error")
 			},
+			wantUpdateTried: true,
+		},
+		{
+			name:        "Rejected - a concurrent request enrolled the record first",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			getItemFunc: record(legacyGateway),
+			updateItemFunc: func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+				return nil, &types.ConditionalCheckFailedException{Message: aws.String("The conditional request failed")}
+			},
+			wantUpdateTried: true,
+		},
+
+		// --- One enrolment per record, inside its window ---
+		{
+			name:  "Rejected - already provisioned (a clone with the public secret)",
+			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "provisioned": b(true),
+			}),
+		},
+		{
+			name:  "Rejected - vaktus already provisioned, even with its own key",
+			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "product": s("vaktus"), "allowed": b(true), "public_key": s(device.rawXY()), "provisioned": b(true),
+			}),
+		},
+		{
+			name:  "Approved - provisioned=false is a fresh record",
+			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "provisioned": b(false),
+			}),
 			wantAllow: true,
 			wantVia:   "secret",
+		},
+		{
+			name:  "Approved - inside the enrolment window",
+			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "enrol_by": n(fixedNow.Unix() + 60),
+			}),
+			wantAllow: true,
+			wantVia:   "secret",
+		},
+		{
+			name:  "Rejected - the enrolment window has closed",
+			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "enrol_by": n(fixedNow.Unix() - 1),
+			}),
+		},
+
+		// --- MAC spellings ---
+		{
+			name:        "Approved - lowercase MAC with dashes finds the AA:BB:.. record",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38-18-2b-84-56-f4", "Secret": "supersecret", "SerialNumber": "38182B8456F4"}},
+			getItemFunc: lookupMust(testMAC, legacyGateway),
+			wantAllow:   true,
+			wantVia:     "secret",
+		},
+		{
+			name:        "Approved - MAC without separators",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38182b8456f4", "Secret": "supersecret", "SerialNumber": "38182B8456F4"}},
+			getItemFunc: lookupMust(testMAC, legacyGateway),
+			wantAllow:   true,
+			wantVia:     "secret",
+		},
+		{
+			name:         "Rejected - MAC is not 12 hex digits",
+			event:        PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38:18:2B:84:56:G4", "Secret": "supersecret", "SerialNumber": "38182B8456G4"}},
+			wantNoLookup: true,
 		},
 		{
 			name:        "Gateway - secret missing",
@@ -327,6 +416,7 @@ func TestHandler(t *testing.T) {
 				tableName:           tableName,
 				templates:           testTemplates(),
 				legacyRecordProduct: "gateway",
+				now:                 func() time.Time { return fixedNow },
 			}
 
 			resp, err := app.Handler(context.Background(), tt.event)
@@ -345,8 +435,8 @@ func TestHandler(t *testing.T) {
 				if resp.ParameterOverrides != nil {
 					t.Errorf("expected nil parameter overrides, got %v", resp.ParameterOverrides)
 				}
-				if len(mockClient.updateItemCalls) != 0 {
-					t.Errorf("a rejected request must not update the registry")
+				if tried := len(mockClient.updateItemCalls) != 0; tried != tt.wantUpdateTried {
+					t.Errorf("registry update attempted = %v, want %v", tried, tt.wantUpdateTried)
 				}
 				return
 			}
@@ -368,6 +458,14 @@ func TestHandler(t *testing.T) {
 			certID := upd.ExpressionAttributeValues[":c"].(*types.AttributeValueMemberS).Value
 			if certID != tt.event.CertificateID {
 				t.Errorf("expected last_certificate_id %q, got %q", tt.event.CertificateID, certID)
+			}
+			key := upd.Key["mac_address"].(*types.AttributeValueMemberS).Value
+			if key != testMAC {
+				t.Errorf("expected the update keyed on %s, got %s", testMAC, key)
+			}
+			cond := aws.ToString(upd.ConditionExpression)
+			if !strings.Contains(cond, "attribute_not_exists(provisioned) OR provisioned = :f") || !strings.Contains(cond, "allowed = :t") {
+				t.Errorf("the update must claim the record conditionally, got condition %q", cond)
 			}
 		})
 	}
@@ -429,6 +527,26 @@ func TestThingNameForMAC(t *testing.T) {
 	} {
 		if got := thingNameForMAC(in); got != want {
 			t.Errorf("thingNameForMAC(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeMAC(t *testing.T) {
+	for in, want := range map[string]string{
+		"38:18:2B:84:56:F4": "38:18:2B:84:56:F4",
+		"38:18:2b:84:56:f4": "38:18:2B:84:56:F4",
+		"38-18-2B-84-56-F4": "38:18:2B:84:56:F4",
+		"38182b8456f4":      "38:18:2B:84:56:F4",
+		" 38182B8456F4 ":    "38:18:2B:84:56:F4",
+	} {
+		got, ok := normalizeMAC(in)
+		if !ok || got != want {
+			t.Errorf("normalizeMAC(%q) = %q, %v; want %q", in, got, ok, want)
+		}
+	}
+	for _, bad := range []string{"", "38:18:2B:84:56", "38:18:2B:84:56:F4:00", "38:18:2B:84:56:G4", "38.18.2B.84.56.F4"} {
+		if got, ok := normalizeMAC(bad); ok {
+			t.Errorf("normalizeMAC(%q) = %q, want rejection", bad, got)
 		}
 	}
 }

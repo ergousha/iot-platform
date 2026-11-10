@@ -20,6 +20,8 @@ type MockIoTClient struct {
 	CreateJobFunc func(ctx context.Context, params *iot.CreateJobInput) (*iot.CreateJobOutput, error)
 	ListJobsFunc  func(ctx context.Context, params *iot.ListJobsInput) (*iot.ListJobsOutput, error)
 	CancelJobFunc func(ctx context.Context, params *iot.CancelJobInput) (*iot.CancelJobOutput, error)
+	// DescribeJobFunc defaults to a job that targets every test product group.
+	DescribeJobFunc func(ctx context.Context, params *iot.DescribeJobInput) (*iot.DescribeJobOutput, error)
 
 	createJobCalls []*iot.CreateJobInput
 	listJobsCalls  []*iot.ListJobsInput
@@ -48,6 +50,13 @@ func (m *MockIoTClient) CancelJob(ctx context.Context, params *iot.CancelJobInpu
 		return m.CancelJobFunc(ctx, params)
 	}
 	return &iot.CancelJobOutput{}, nil
+}
+
+func (m *MockIoTClient) DescribeJob(ctx context.Context, params *iot.DescribeJobInput, optFns ...func(*iot.Options)) (*iot.DescribeJobOutput, error) {
+	if m.DescribeJobFunc != nil {
+		return m.DescribeJobFunc(ctx, params)
+	}
+	return &iot.DescribeJobOutput{Job: &iottypes.Job{JobId: params.JobId, Targets: []string{testGroupARN, testVaktusGroupARN}}}, nil
 }
 
 func (m *MockIoTClient) cancelledIDs() []string {
@@ -684,5 +693,66 @@ func TestReleaseLeavesOtherProductsAlone(t *testing.T) {
 	}
 	if got, want := mockIoT.cancelledIDs(), []string{"ota-vaktus-firmware_v0-7-0-1790300000000"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("expected only the older vaktus job cancelled, got %v", got)
+	}
+}
+
+// A release lists its CANARY group, which also returns the jobs aimed at the
+// parent fleet group (scripts/promote.sh's). Those keep serving the fleet: only
+// jobs that target the canary group itself are superseded.
+func TestReleaseLeavesParentGroupJobsAlone(t *testing.T) {
+	const (
+		canaryARN    = "arn:aws:iot:eu-central-1:123456789012:thinggroup/esp32-ztp-vaktus-canary"
+		fleetARN     = "arn:aws:iot:eu-central-1:123456789012:thinggroup/esp32-ztp-vaktus-fleet"
+		oldCanaryJob = "ota-vaktus-firmware_v0-8-0-1790300000000"
+		fleetJob     = "ota-vaktus-firmware_v0-8-0-1790400000000" // promoted later
+		goneJob      = "ota-vaktus-firmware_v0-7-0-1790200000000"
+	)
+	cfg := testConfig()
+	cfg.Products["vaktus"] = ProductGroup{ARN: canaryARN, Name: "esp32-ztp-vaktus-canary"}
+
+	mockIoT := &MockIoTClient{
+		ListJobsFunc: func(ctx context.Context, params *iot.ListJobsInput) (*iot.ListJobsOutput, error) {
+			return &iot.ListJobsOutput{Jobs: jobSummaries(oldCanaryJob, fleetJob, goneJob)}, nil
+		},
+		DescribeJobFunc: func(ctx context.Context, params *iot.DescribeJobInput) (*iot.DescribeJobOutput, error) {
+			switch aws.ToString(params.JobId) {
+			case oldCanaryJob:
+				return &iot.DescribeJobOutput{Job: &iottypes.Job{Targets: []string{canaryARN}}}, nil
+			case fleetJob:
+				return &iot.DescribeJobOutput{Job: &iottypes.Job{Targets: []string{fleetARN}}}, nil
+			default:
+				return nil, &iottypes.ResourceNotFoundException{Message: aws.String("deleted")}
+			}
+		},
+	}
+	app := &App{iotClient: mockIoT, cfg: cfg}
+
+	resp, err := app.Handler(context.Background(), s3Event("vaktus/firmware_v0.9.0.bin"))
+	if err != nil {
+		t.Fatalf("unexpected handler error: %v", err)
+	}
+	if !strings.Contains(resp.Body, "created for thing group esp32-ztp-vaktus-canary") {
+		t.Errorf("the new release must survive (the newer-timestamped fleet job does not compete), got %q", resp.Body)
+	}
+	if got, want := mockIoT.cancelledIDs(), []string{oldCanaryJob}; !reflect.DeepEqual(got, want) {
+		t.Errorf("expected only the older canary job cancelled, got %v", got)
+	}
+}
+
+func TestDescribeJobFailureIsRetried(t *testing.T) {
+	mockIoT := &MockIoTClient{
+		ListJobsFunc: func(ctx context.Context, params *iot.ListJobsInput) (*iot.ListJobsOutput, error) {
+			return &iot.ListJobsOutput{Jobs: jobSummaries("ota-firmware_v0-9-0-1790400000000")}, nil
+		},
+		DescribeJobFunc: func(ctx context.Context, params *iot.DescribeJobInput) (*iot.DescribeJobOutput, error) {
+			return nil, errors.New("throttled")
+		},
+	}
+	app := &App{iotClient: mockIoT, cfg: testConfig()}
+	if _, err := app.Handler(context.Background(), s3Event("firmware_v1.0.0.bin")); err == nil {
+		t.Fatal("a DescribeJob failure must fail the invocation so Lambda retries it")
+	}
+	if len(mockIoT.cancelJobCalls) != 0 {
+		t.Errorf("nothing may be cancelled when the targets are unknown, got %v", mockIoT.cancelledIDs())
 	}
 }
