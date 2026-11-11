@@ -4,11 +4,13 @@
 #
 #   scripts/claim-window.sh [minutes]     (default 30, at most 120)
 #
-# The claim is INACTIVE the rest of the time (var.claim_active = false), because
-# it is extractable from any firmware image or device. Register the device in
-# the registry first (allowed=true, provisioned=false; seed-device does this),
-# then run this and power the device: it enrols with the claim within a minute
-# or two and from then on uses its own certificate.
+# Superseded by `ergo commission` (iot-device-sdk), which arms and disarms the
+# claim itself; kept for a manual enrolment. The claim is INACTIVE the rest of
+# the time. The OTA controller's tick (every 15 min) disarms it unless a
+# registry record has an open window (allowed=true, provisioned=false,
+# enrol_by in the future), so register the device first (`ergo register`),
+# then run this and power the device: it enrols with the claim within a
+# minute or two and from then on uses its own certificate.
 #
 # Uses the caller's AWS credentials (the owner's), not anything in the repo,
 # and jq.

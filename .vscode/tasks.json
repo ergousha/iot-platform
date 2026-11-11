@@ -4,7 +4,7 @@
     {
       "label": "Go: Build Lambdas",
       "type": "shell",
-      "command": "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o lambda/pre_provisioning_hook/bootstrap ./lambda/pre_provisioning_hook && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o lambda/ota_trigger/bootstrap ./lambda/ota_trigger",
+      "command": "GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o lambda/pre_provisioning_hook/bootstrap ./lambda/pre_provisioning_hook && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o lambda/ota_controller/bootstrap ./lambda/ota_controller && GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o lambda/kill_switch/bootstrap ./lambda/kill_switch",
       "group": {
         "kind": "build",
         "isDefault": true
@@ -36,7 +36,7 @@
     {
       "label": "Go: Clean Binaries",
       "type": "shell",
-      "command": "rm -f lambda/pre_provisioning_hook/bootstrap lambda/ota_trigger/bootstrap && rm -rf .build/*.zip",
+      "command": "rm -f lambda/pre_provisioning_hook/bootstrap lambda/ota_controller/bootstrap lambda/kill_switch/bootstrap && rm -rf .build/*.zip",
       "problemMatcher": []
     },
     {

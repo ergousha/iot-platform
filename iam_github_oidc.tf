@@ -3,12 +3,14 @@
 # ---------------------------------------------------------------------------
 
 locals {
-  # The OIDC subject of each product's repository, main branch only. GitHub
-  # puts the immutable owner and repository ids in the subject, so a renamed
-  # or re-created repository with the same name cannot assume the role.
+  # The OIDC subject of each product's repository, Environment `release`
+  # only (which only protected main may deploy to; the signing key lives
+  # there). GitHub puts the immutable owner and repository ids in the subject,
+  # so a renamed or re-created repository with the same name cannot assume
+  # the role.
   github_oidc_subs = {
     for id, p in local.products :
-    id => "repo:${split("/", p.github_repository)[0]}@${var.github_owner_id}/${split("/", p.github_repository)[1]}@${p.github_repository_id}:ref:refs/heads/main"
+    id => "repo:${split("/", p.github_repository)[0]}@${var.github_owner_id}/${split("/", p.github_repository)[1]}@${p.github_repository_id}:environment:release"
   }
 }
 
@@ -18,9 +20,10 @@ resource "aws_iam_openid_connect_provider" "github" {
   thumbprint_list = ["6938fd4d98bab03faadb97b34396831e3780aea1", "1c58a3a8518e8759bf075b76b750d4f2df264fcd"] # GitHub's standard thumbprints
 }
 
-# One role per product, trusted by that product's repository only. A release of
-# one product therefore cannot overwrite another's firmware or read its
-# template parameter.
+# One role per product, trusted by that product's repository only, and only
+# from inside the SDK's reusable release workflow (job_workflow_ref): a
+# workflow edited in the product repository cannot assume it. A release of
+# one product therefore cannot write another's firmware.
 data "aws_iam_policy_document" "github_assume_role" {
   for_each = local.products
 
@@ -40,6 +43,12 @@ data "aws_iam_policy_document" "github_assume_role" {
       variable = "token.actions.githubusercontent.com:sub"
       values   = [local.github_oidc_subs[each.key]]
     }
+    # Callers pin the workflow by commit SHA; any ref of it is accepted.
+    condition {
+      test     = "StringLike"
+      variable = "token.actions.githubusercontent.com:job_workflow_ref"
+      values   = ["${var.release_workflow}@*"]
+    }
   }
 }
 
@@ -53,33 +62,13 @@ resource "aws_iam_role" "github_actions" {
 data "aws_iam_policy_document" "github_actions_policy" {
   for_each = local.products
 
-  # Uploads go under the product's own prefix, where the OTA trigger maps them
-  # to the product's fleet group. The legacy product may still upload at the
-  # bucket root, where its releases went before products existed.
+  # Only the product's own releases/<product>/ prefix. GetObject lets a re-run
+  # compare what is already there (uploads are If-None-Match: *, so a
+  # published release is never overwritten). No SSM, no IoT: images are built
+  # without AWS, and the OTA controller verifies every upload's signature.
   statement {
-    actions = ["s3:PutObject"]
-    resources = concat(
-      ["${aws_s3_bucket.firmware.arn}/${each.key}/*"],
-      each.value.legacy ? ["${aws_s3_bucket.firmware.arn}/firmware_*"] : [],
-    )
-  }
-
-  # The firmware release build compiles the IoT endpoint, the provisioning
-  # template and the claim identity into the image; its build.rs reads them
-  # from these parameters. Read-only, and exactly these. The SecureStrings use
-  # the AWS managed aws/ssm key, whose key policy already allows decryption
-  # through SSM for principals in this account.
-  statement {
-    actions = ["ssm:GetParameter"]
-    resources = concat(
-      [
-        aws_ssm_parameter.iot_endpoint.arn,
-        aws_ssm_parameter.claim_certificate.arn,
-        aws_ssm_parameter.claim_private_key.arn,
-        aws_ssm_parameter.product_provisioning_template[each.key].arn,
-      ],
-      each.value.legacy ? [aws_ssm_parameter.provisioning_template[0].arn] : [],
-    )
+    actions   = ["s3:PutObject", "s3:GetObject"]
+    resources = ["${aws_s3_bucket.firmware.arn}/releases/${each.key}/*"]
   }
 }
 

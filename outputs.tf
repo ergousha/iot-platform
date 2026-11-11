@@ -9,7 +9,7 @@ output "provisioning_template_names" {
 }
 
 output "fleet_thing_groups" {
-  description = "Fleet thing group of each product: the target of the jobs scripts/promote.sh creates."
+  description = "Fleet thing group of each product: target of its fleet OTA job, and holder of its OTA state attributes."
   value       = { for id, g in aws_iot_thing_group.fleet : id => g.name }
 }
 
@@ -18,23 +18,27 @@ output "dynamodb_table" {
 }
 
 output "github_actions_role_arns" {
-  description = "IAM role each product's release workflow assumes through GitHub OIDC (the repository's AWS_ROLE_ARN variable)."
+  description = "IAM role each product's release workflow assumes through GitHub OIDC from Environment `release` (the repository's AWS_ROLE_ARN variable)."
   value       = { for id, r in aws_iam_role.github_actions : id => r.arn }
 }
 
 output "firmware_bucket_name" {
-  description = "S3 bucket where the release workflows upload firmware images, each under s3://<bucket>/<product>/."
+  description = "S3 bucket the release workflows publish to, under s3://<bucket>/releases/<product>/<X.Y.Z>/ (the repository's AWS_FIRMWARE_BUCKET variable)."
   value       = aws_s3_bucket.firmware.id
 }
 
 output "canary_thing_groups" {
-  description = "Canary thing group of each product: the target of the OTA job every release creates."
+  description = "Canary thing group of each product: the target of each release's canary job."
   value       = { for id, g in aws_iot_thing_group.canary : id => g.name }
 }
 
-# The claim certificate and key are deliberately not outputs: they are in SSM
-# (/esp32-ztp/poc/claim_certificate_pem, /esp32-ztp/poc/claim_private_key),
-# where the firmware build reads them.
+output "excluded_thing_groups" {
+  description = "Excluded thing group of each product: devices that failed a fleet job (scripts/ota.sh target brings one back)."
+  value       = { for id, g in aws_iot_thing_group.excluded : id => g.name }
+}
+
+# The claim is not in Terraform at all: the OTA controller keeps it in SSM
+# (/iot-platform/claim/{cert,key}), where only `ergo commission` reads it.
 #
 # Amazon Root CA 1:
 #   curl -s https://www.amazontrust.com/repository/AmazonRootCA1.pem \
