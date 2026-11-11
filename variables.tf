@@ -16,12 +16,6 @@ variable "log_retention_days" {
   default     = 3
 }
 
-variable "claim_active" {
-  description = "Whether the shared claim certificate is ACTIVE. Keep false: scripts/claim-window.sh opens a timed enrolment window instead."
-  type        = bool
-  default     = false
-}
-
 variable "debug_telemetry_logs" {
   description = "Route device telemetry (dt/+/data, dt/+/opcua) to CloudWatch Logs. Costs per message; enable only while debugging or for a gateway HIL run."
   type        = bool
