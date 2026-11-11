@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
@@ -441,5 +442,38 @@ func TestLoadConfig(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %s in %v", want, err)
 		}
+	}
+}
+
+type fakeHTTP struct{ body string }
+
+func (f fakeHTTP) Do(*http.Request) (*http.Response, error) {
+	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(f.body))}, nil
+}
+
+// Only the release workflow's pre-releases (with a manifest.sig) can be
+// orphans; a pre-release from before it, like vaktus v0.0.1, is not one.
+func TestOrphansAreWorkflowReleasesMissingInS3(t *testing.T) {
+	a, _, _, _, _, _ := testApp()
+	old := t0.Add(-2 * time.Hour).Format(time.RFC3339)
+	recent := t0.Add(-10 * time.Minute).Format(time.RFC3339)
+	sig := `[{"name":"app.bin"},{"name":"manifest.sig"}]`
+	a.http = fakeHTTP{body: `[
+		{"tag_name":"v0.0.1","prerelease":true,"created_at":"` + old + `","assets":[]},
+		{"tag_name":"v0.9.8","prerelease":true,"created_at":"` + old + `","assets":[]},
+		{"tag_name":"v0.9.3","prerelease":true,"created_at":"` + old + `","assets":` + sig + `},
+		{"tag_name":"v0.9.4","prerelease":true,"created_at":"` + recent + `","assets":` + sig + `},
+		{"tag_name":"v0.9.5","prerelease":true,"created_at":"` + old + `","assets":` + sig + `},
+		{"tag_name":"v0.9.6","prerelease":false,"created_at":"` + old + `","assets":` + sig + `},
+		{"tag_name":"v0.9.7","draft":true,"prerelease":true,"created_at":"` + old + `","assets":` + sig + `},
+		{"tag_name":"v0.9.1","prerelease":true,"created_at":"` + old + `","assets":` + sig + `}
+	]`}
+	s := &Snapshot{Now: t0}
+	s.State.FleetVersion, _ = ParseVersion("0.9.2")
+	v5, _ := ParseVersion("0.9.5")
+	s.Releases = []Release{{Version: v5}}
+	got := a.orphans(context.Background(), ProductConfig{ID: "vaktus", Repository: "ergousha/vaktus"}, s)
+	if strings.Join(got, ",") != "0.9.3" {
+		t.Fatalf("orphans %v, want [0.9.3]", got)
 	}
 }
