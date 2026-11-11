@@ -81,12 +81,16 @@ locals {
   # Policy variable, resolved by AWS per connection. `$$` escapes the Terraform
   # interpolation so the literal `${iot:...}` reaches the policy document.
   thing = "$${iot:Connection.Thing.ThingName}"
+
+  # The thing's `product` attribute (the provisioning template sets it). A
+  # device may publish straight into its own product's rules over Basic
+  # Ingest (`$aws/rules/<product>_*`): no messaging charge, and no other
+  # product's rules. A thing without the attribute matches nothing.
+  product = "$${iot:Connection.Thing.Attributes[product]}"
 }
 
-resource "aws_iot_policy" "device" {
-  name = "${var.project_name}-device-policy"
-
-  policy = jsonencode({
+locals {
+  device_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
@@ -110,6 +114,7 @@ resource "aws_iot_policy" "device" {
           # The OPC UA config plane lives on the `opcua` NAMED shadow, so this
           # has to cover `shadow/name/<name>/...`, not just the classic shadow.
           "${local.iot_arn}:topic/$aws/things/${local.thing}/shadow/*",
+          "${local.iot_arn}:topic/$aws/rules/${local.product}_*",
         ]
       },
       {
@@ -134,6 +139,21 @@ resource "aws_iot_policy" "device" {
       },
     ]
   })
+}
+
+resource "aws_iot_policy" "device" {
+  name = "${var.project_name}-device-policy"
+
+  policy = local.device_policy
+
+  lifecycle {
+    precondition {
+      # AWS IoT refuses a policy document over 2048 characters (whitespace
+      # excluded), and the apply would fail halfway. jsonencode is compact.
+      condition     = length(local.device_policy) <= 2048
+      error_message = "The device policy is ${length(local.device_policy)} characters; AWS IoT allows 2048."
+    }
+  }
 }
 
 # ---------------------------------------------------------------------------
