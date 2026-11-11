@@ -25,6 +25,22 @@ type mockIoT struct {
 	attachErr  func(target string) error
 	disableErr error
 	certErr    error
+	listErr    error
+}
+
+func (m *mockIoT) ListTargetsForPolicy(ctx context.Context, p *iot.ListTargetsForPolicyInput, _ ...func(*iot.Options)) (*iot.ListTargetsForPolicyOutput, error) {
+	if aws.ToString(p.PolicyName) != claimPolicy {
+		return nil, errors.New("wrong policy")
+	}
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	// The claim, and the quarantine-style non-certificate target a policy
+	// could also have.
+	return &iot.ListTargetsForPolicyOutput{Targets: []string{
+		"arn:aws:iot:eu-central-1:1:cert/" + claimID,
+		"arn:aws:iot:eu-central-1:1:thinggroup/not-a-cert",
+	}}, nil
 }
 
 func (m *mockIoT) UpdateCertificate(ctx context.Context, p *iot.UpdateCertificateInput, _ ...func(*iot.Options)) (*iot.UpdateCertificateOutput, error) {
@@ -77,10 +93,11 @@ func (m *mockSSM) PutParameter(ctx context.Context, p *ssm.PutParameterInput, _ 
 }
 
 const (
-	claimID    = "claim123"
-	denyPolicy = "esp32-ztp-guard-deny-all"
-	groupA     = "arn:aws:iot:eu-central-1:1:thinggroup/esp32-ztp-fleet"
-	groupB     = "arn:aws:iot:eu-central-1:1:thinggroup/esp32-ztp-vaktus-fleet"
+	claimID     = "claim123"
+	claimPolicy = "esp32-ztp-claim-policy"
+	denyPolicy  = "esp32-ztp-guard-deny-all"
+	groupA      = "arn:aws:iot:eu-central-1:1:thinggroup/esp32-ztp-fleet"
+	groupB      = "arn:aws:iot:eu-central-1:1:thinggroup/esp32-ztp-vaktus-fleet"
 )
 
 var fixedNow = time.Date(2026, 11, 10, 20, 0, 0, 0, time.UTC)
@@ -90,7 +107,7 @@ func testEnv() map[string]string {
 		"ALARM_SCOPES": `{"esp32-ztp-guard-publish-5m":"traffic","esp32-ztp-guard-publish-30m":"fleet",` +
 			`"esp32-ztp-guard-connect-5m":"provisioning","esp32-ztp-guard-hook-5m":"provisioning","esp32-ztp-guard-ota-errors":"notify"}`,
 		"BUDGET_SCOPES":         `{"esp32-ztp-guard-traffic":"traffic","esp32-ztp-guard-fleet":"fleet"}`,
-		"CLAIM_CERTIFICATE_ID":  claimID,
+		"CLAIM_POLICY":          claimPolicy,
 		"KILLABLE_RULES":        `["esp32_ztp_telemetry_to_logs","esp32_ztp_opcua_telemetry_to_logs"]`,
 		"DENY_POLICY":           denyPolicy,
 		"FLEET_GROUP_ARNS":      `["` + groupA + `","` + groupB + `"]`,
@@ -259,6 +276,18 @@ func TestActionFailuresAreCollected(t *testing.T) {
 	}
 }
 
+func TestClaimLookupFailureIsReported(t *testing.T) {
+	app, m := newApp(t, nil)
+	m.listErr = errors.New("throttled")
+	err := app.Handler(context.Background(), snsEvent(alarm("esp32-ztp-guard-publish-5m", "ALARM")))
+	if err == nil || !strings.Contains(err.Error(), "claim certificates") {
+		t.Fatalf("expected the lookup failure, got %v", err)
+	}
+	if len(m.rules) != 2 {
+		t.Errorf("the traffic scope must still act, got rules=%v", m.rules)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	env := testEnv()
 	if _, err := loadConfig(func(k string) string { return env[k] }); err != nil {
@@ -269,7 +298,7 @@ func TestLoadConfig(t *testing.T) {
 		"BUDGET_SCOPES":         `not json`,
 		"KILLABLE_RULES":        `[""]`,
 		"FLEET_GROUP_ARNS":      `[]`,
-		"CLAIM_CERTIFICATE_ID":  "",
+		"CLAIM_POLICY":          "",
 		"DENY_POLICY":           "",
 		"GUARD_STATE_PARAMETER": "",
 	} {

@@ -13,6 +13,7 @@ locals {
     for id, p in var.products : id => merge(p, {
       fleet_group_name           = coalesce(p.fleet_group_name, "${var.project_name}-${id}-fleet")
       canary_group_name          = coalesce(p.canary_group_name, "${var.project_name}-${id}-canary")
+      excluded_group_name        = coalesce(p.excluded_group_name, "${var.project_name}-${id}-excluded")
       provisioning_template_name = coalesce(p.provisioning_template_name, "${var.project_name}-${id}-fleet-template")
       github_actions_role_name   = coalesce(p.github_actions_role_name, "${var.project_name}-${id}-github-actions-role")
     })

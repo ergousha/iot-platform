@@ -15,18 +15,30 @@ locals {
 
 # ---------------------------------------------------------------------------
 # 1) CLAIM (bootstrap) certificate.
-#    COMMON certificate carried by all devices leaving the factory.
-#    Can only access provisioning MQTT topics; cannot send telemetry.
-#    No csr => AWS generated the keypair (it is in SSM for the firmware build).
+#    The certificate a board enrols with, carried only between `ergo
+#    commission` and its enrolment (it is erased from the board afterwards).
+#    It can reach the provisioning topics and nothing else.
 #
-#    INACTIVE by default: the claim is extractable from any image or device, so
-#    it only works while a device is being enrolled. Open an enrolment window
-#    with scripts/claim-window.sh (it re-activates the claim for a limited time);
-#    the next apply also closes it. Provisioned devices use their own
-#    certificates and never need the claim.
+#    Not in Terraform (platform plan, Phase 3): the OTA controller creates it
+#    from a CSR whose key never leaves the Lambda's memory and SSM
+#    (/iot-platform/claim/{cert,key}), keeps it INACTIVE outside enrolment
+#    windows, rotates it after site windows and on demand
+#    (scripts/ota.sh rotate-claim), and deletes the previous one. Terraform
+#    owns only the policy; its targets are the controller's. The claim key is
+#    therefore never in Terraform state.
 # ---------------------------------------------------------------------------
-resource "aws_iot_certificate" "claim" {
-  active = var.claim_active
+removed {
+  from = aws_iot_certificate.claim
+  lifecycle {
+    destroy = false # the controller rotates it, then deletes it
+  }
+}
+
+removed {
+  from = aws_iot_policy_attachment.claim
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "aws_iot_policy" "claim" {
@@ -58,11 +70,6 @@ resource "aws_iot_policy" "claim" {
       },
     ]
   })
-}
-
-resource "aws_iot_policy_attachment" "claim" {
-  policy = aws_iot_policy.claim.name
-  target = aws_iot_certificate.claim.arn
 }
 
 # ---------------------------------------------------------------------------
@@ -157,16 +164,21 @@ resource "aws_iot_policy" "device" {
 }
 
 # ---------------------------------------------------------------------------
-# 3) OTA thing groups, one pair per product.
-#    A release's OTA job targets the product's CANARY group (the ota_trigger
-#    Lambda); scripts/promote.sh then creates the job for the FLEET group once
-#    the canaries succeeded. CANARY is a child of FLEET, so canary devices are
-#    part of every fleet job too (they already run the version and settle it
-#    without a download). AWS IoT allows a thing in
-#    only one group of a hierarchy, which keeps the two sets disjoint. The
-#    products' hierarchies are separate, so a job never crosses products.
-#    New devices join their product's fleet group through its provisioning
-#    template below; canary devices are listed in var.products[*].canary_things.
+# 3) OTA thing groups, three per product.
+#    fleet     every provisioned device (the provisioning template puts new
+#              ones here). Target of the CONTINUOUS fleet job, and holder of
+#              the product's OTA state in its attributes (ota_mode,
+#              soak_hours, fleet_version, halted_version, ...), which only the
+#              OTA controller and the owner write: Terraform ignores them.
+#    canary    a child of fleet: target of each release's SNAPSHOT canary job.
+#              A thing is in one group of a hierarchy, so the two sets are
+#              disjoint, and canaries get the fleet job too (they already run
+#              the version and settle it without a download). Membership is
+#              the controller's: registry records with canary=true, else a
+#              device it picks, and it substitutes an unplugged canary.
+#    excluded  outside the hierarchy: a device that failed a fleet job while
+#              others succeeded, until `scripts/ota.sh target` brings it back.
+#    The products' hierarchies are separate, so a job never crosses products.
 # ---------------------------------------------------------------------------
 resource "aws_iot_thing_group" "fleet" {
   for_each = local.products
@@ -174,6 +186,11 @@ resource "aws_iot_thing_group" "fleet" {
 
   properties {
     description = "All provisioned ${each.value.description} devices. Promoted OTA jobs for product '${each.key}' target this group."
+  }
+
+  lifecycle {
+    # The OTA state; see above.
+    ignore_changes = [properties[0].attribute_payload]
   }
 }
 
@@ -187,19 +204,22 @@ resource "aws_iot_thing_group" "canary" {
   }
 }
 
-locals {
-  canary_memberships = merge([
-    for id, p in local.products : {
-      for thing in p.canary_things : "${id}/${thing}" => { product = id, thing = thing }
-    }
-  ]...)
+resource "aws_iot_thing_group" "excluded" {
+  for_each = local.products
+  name     = each.value.excluded_group_name
+
+  properties {
+    description = "${each.value.description} devices that failed a fleet OTA job while others succeeded. No fleet job reaches them."
+  }
 }
 
-resource "aws_iot_thing_group_membership" "canary" {
-  for_each = local.canary_memberships
-
-  thing_name       = each.value.thing
-  thing_group_name = aws_iot_thing_group.canary[each.value.product].name
+# Canary membership was Terraform's (var.products[*].canary_things) until the
+# controller took it over. The memberships stay as they are.
+removed {
+  from = aws_iot_thing_group_membership.canary
+  lifecycle {
+    destroy = false
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -289,11 +309,6 @@ moved {
 moved {
   from = aws_iot_thing_group.canary
   to   = aws_iot_thing_group.canary["gateway"]
-}
-
-moved {
-  from = aws_iot_thing_group_membership.canary["28848553144F"]
-  to   = aws_iot_thing_group_membership.canary["gateway/28848553144F"]
 }
 
 moved {

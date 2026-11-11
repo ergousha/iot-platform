@@ -45,6 +45,9 @@ variable "products" {
     group, provisioning template, SSM template parameter and GitHub Actions
     role, so releases of one product can never reach another.
 
+    soak_hours is how long a release must run on the canaries before the
+    OTA controller promotes it (the fleet attribute soak_hours overrides it).
+
     The *_name fields default to "<project_name>-<id>-..." names; the gateway
     pins the names it had before products existed, so no live resource is
     renamed (a rename would recreate it).
@@ -56,12 +59,8 @@ variable "products" {
     github_repository    = string
     github_repository_id = number
 
-    # Things placed in the canary group. A thing can only be in one group of a
-    # hierarchy and new devices start in the fleet group, so move a device out
-    # of it first (aws iot update-thing-groups-for-thing --thing-name <thing>
-    # --thing-groups-to-remove <fleet group>). A thing must exist before it can
-    # be listed here.
-    canary_things = optional(list(string), [])
+    # Hours a release soaks on the canaries before the fleet job.
+    soak_hours = optional(number, 6)
 
     # true: the device keeps its private key in a secure element and enrols with
     # a CSR. The pre-provisioning hook then requires the registry record's
@@ -77,6 +76,7 @@ variable "products" {
 
     fleet_group_name           = optional(string)
     canary_group_name          = optional(string)
+    excluded_group_name        = optional(string)
     provisioning_template_name = optional(string)
     github_actions_role_name   = optional(string)
   }))
@@ -86,7 +86,6 @@ variable "products" {
       description          = "OPC UA gateway (Waveshare ESP32-S3-ETH)"
       github_repository    = "ergousha/esp32-opcua-gateway-rust"
       github_repository_id = 1302001123
-      canary_things        = ["28848553144F"]
       legacy               = true
 
       fleet_group_name           = "esp32-ztp-fleet"
@@ -99,11 +98,8 @@ variable "products" {
       github_repository    = "ergousha/esp32-display-vaktus-salat-rust"
       github_repository_id = 1290322529
       require_public_key   = true
-      # The bench unit (ATECC608B 0123C471D3B627CFEE). Before applying, move it
-      # out of the fleet group (a thing can be in one group of a hierarchy):
-      # aws iot update-thing-groups-for-thing --thing-name 38182B8456F4 \
-      #   --thing-groups-to-remove esp32-ztp-vaktus-fleet
-      canary_things = ["38182B8456F4"]
+      # Prayer-time boundary bugs matter more than speed (plan §10).
+      soak_hours = 24
     }
   }
 
@@ -113,10 +109,8 @@ variable "products" {
   }
 
   validation {
-    condition = alltrue(flatten([
-      for p in values(var.products) : [for t in p.canary_things : can(regex("^[a-zA-Z0-9:_-]{1,128}$", t))]
-    ]))
-    error_message = "Canary thing names are 1-128 characters of letters, digits, ':', '_' and '-'."
+    condition     = alltrue([for p in values(var.products) : p.soak_hours >= 0 && p.soak_hours <= 168 && floor(p.soak_hours) == p.soak_hours])
+    error_message = "soak_hours is a whole number of hours from 0 to 168."
   }
 
   validation {
@@ -137,8 +131,10 @@ variable "github_owner_id" {
 }
 
 # ---------------------------------------------------------------------------
-# OTA job rollout policy. The ota_trigger Lambda receives these as environment
-# variables and re-checks the same ranges (the ones AWS IoT accepts) at start.
+# OTA jobs. The ota_controller Lambda receives these as environment variables
+# and re-checks the same ranges (the ones AWS IoT accepts) at start. Failures
+# are the controller's to judge (halt, exclusion, rerun), so jobs carry no
+# abort configuration.
 # ---------------------------------------------------------------------------
 variable "ota_rollout_base_rate_per_minute" {
   description = "Devices notified per minute when an OTA job starts (exponential rollout base rate)."
@@ -184,37 +180,38 @@ variable "ota_rollout_max_per_minute" {
   }
 }
 
-variable "ota_abort_failure_percentage" {
-  description = "Cancel an OTA job once at least this percentage of its executions ended FAILED, TIMED_OUT or REJECTED."
-  type        = number
-  default     = 20
-
-  validation {
-    condition     = can(regex("^[0-9]+([.][0-9]{1,2})?$", tostring(var.ota_abort_failure_percentage))) && var.ota_abort_failure_percentage >= 0.01 && var.ota_abort_failure_percentage <= 100
-    error_message = "Must be from 0.01 to 100 with at most two decimal places."
-  }
-}
-
-variable "ota_abort_min_executed_things" {
-  description = "The abort percentage is only applied once this many devices have been notified of the job. 1: with a handful of devices, the first failure on a canary stops the release."
-  type        = number
-  default     = 1
-
-  validation {
-    condition     = floor(var.ota_abort_min_executed_things) == var.ota_abort_min_executed_things && var.ota_abort_min_executed_things >= 1
-    error_message = "Must be an integer of at least 1."
-  }
-}
-
 variable "ota_in_progress_timeout_minutes" {
-  description = "Minutes a job execution may stay IN_PROGRESS before AWS IoT marks it TIMED_OUT (a device that died or never came back)."
+  description = "Minutes a job execution may stay IN_PROGRESS before AWS IoT marks it TIMED_OUT (a device that died or never came back). Two retries follow."
   type        = number
-  default     = 30
+  default     = 60
 
   validation {
     condition     = floor(var.ota_in_progress_timeout_minutes) == var.ota_in_progress_timeout_minutes && var.ota_in_progress_timeout_minutes >= 1 && var.ota_in_progress_timeout_minutes <= 10080
     error_message = "Must be an integer from 1 to 10080 (7 days)."
   }
+}
+
+variable "firmware_download_url_template" {
+  description = <<-EOT
+    Image URL put into OTA job documents, with {product}, {version} and
+    {repository} placeholders. Empty: the firmware CloudFront distribution,
+    https://<distribution>/{product}/{version}/app.bin. The fallback if the
+    distribution cannot be on the CloudFront Free plan (plan §10):
+    https://github.com/{repository}/releases/download/v{version}/app.bin
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.firmware_download_url_template == "" || (startswith(var.firmware_download_url_template, "https://") && strcontains(var.firmware_download_url_template, "{version}"))
+    error_message = "Must be empty or an https URL with a {version} placeholder."
+  }
+}
+
+variable "release_workflow" {
+  description = "The reusable workflow (owner/repo/path, no ref) every product's release must run in to assume its GitHub OIDC role (the job_workflow_ref claim)."
+  type        = string
+  default     = "ergousha/iot-device-sdk/.github/workflows/firmware-release.yml"
 }
 
 # ---------------------------------------------------------------------------

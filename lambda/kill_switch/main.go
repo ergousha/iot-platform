@@ -4,7 +4,9 @@
 // invokes this Lambda. Each allow-listed alarm or budget maps to a scope, and
 // every scope includes the ones below it:
 //
-//	provisioning  the claim certificate goes INACTIVE (no enrolment at all)
+//	provisioning  the claim certificate goes INACTIVE (no enrolment at all);
+//	              it is found through the claim policy, since the OTA
+//	              controller rotates it
 //	traffic       also disables the killable IoT rules (telemetry -> Logs)
 //	fleet         also attaches the deny-all policy to every fleet thing group:
 //	              each device is refused on its next publish or connect, the
@@ -77,7 +79,7 @@ func parseScope(name string) (Scope, error) {
 type Config struct {
 	AlarmScopes    map[string]Scope
 	BudgetScopes   map[string]Scope
-	ClaimCertID    string
+	ClaimPolicy    string
 	KillableRules  []string
 	DenyPolicy     string
 	FleetGroupARNs []string
@@ -132,12 +134,12 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	} else if len(c.FleetGroupARNs) == 0 {
 		errs = append(errs, errors.New("FLEET_GROUP_ARNS lists no group"))
 	}
-	for _, name := range []string{"CLAIM_CERTIFICATE_ID", "DENY_POLICY", "GUARD_STATE_PARAMETER"} {
+	for _, name := range []string{"CLAIM_POLICY", "DENY_POLICY", "GUARD_STATE_PARAMETER"} {
 		if getenv(name) == "" {
 			errs = append(errs, fmt.Errorf("%s is required", name))
 		}
 	}
-	c.ClaimCertID = getenv("CLAIM_CERTIFICATE_ID")
+	c.ClaimPolicy = getenv("CLAIM_POLICY")
 	c.DenyPolicy = getenv("DENY_POLICY")
 	c.StateParameter = getenv("GUARD_STATE_PARAMETER")
 	return c, errors.Join(errs...)
@@ -145,6 +147,7 @@ func loadConfig(getenv func(string) string) (Config, error) {
 
 // IoTAPI is the AWS IoT subset the kill switch uses.
 type IoTAPI interface {
+	ListTargetsForPolicy(ctx context.Context, params *iot.ListTargetsForPolicyInput, optFns ...func(*iot.Options)) (*iot.ListTargetsForPolicyOutput, error)
 	UpdateCertificate(ctx context.Context, params *iot.UpdateCertificateInput, optFns ...func(*iot.Options)) (*iot.UpdateCertificateOutput, error)
 	DisableTopicRule(ctx context.Context, params *iot.DisableTopicRuleInput, optFns ...func(*iot.Options)) (*iot.DisableTopicRuleOutput, error)
 	AttachPolicy(ctx context.Context, params *iot.AttachPolicyInput, optFns ...func(*iot.Options)) (*iot.AttachPolicyOutput, error)
@@ -308,15 +311,7 @@ func (a *App) enforce(ctx context.Context, scope Scope) error {
 	var errs []error
 
 	if scope >= ScopeProvisioning {
-		_, err := a.iot.UpdateCertificate(ctx, &iot.UpdateCertificateInput{
-			CertificateId: aws.String(a.cfg.ClaimCertID),
-			NewStatus:     iottypes.CertificateStatusInactive,
-		})
-		if err != nil {
-			errs = append(errs, fmt.Errorf("deactivating the claim certificate: %w", err))
-		} else {
-			slog.Info("Claim certificate INACTIVE")
-		}
+		errs = append(errs, a.deactivateClaims(ctx))
 	}
 
 	if scope >= ScopeTraffic {
@@ -345,6 +340,39 @@ func (a *App) enforce(ctx context.Context, scope Scope) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// deactivateClaims sets every certificate the claim policy is attached to
+// INACTIVE: normally one, two while the OTA controller rotates the claim.
+func (a *App) deactivateClaims(ctx context.Context) error {
+	var errs []error
+	var marker *string
+	for {
+		out, err := a.iot.ListTargetsForPolicy(ctx, &iot.ListTargetsForPolicyInput{PolicyName: aws.String(a.cfg.ClaimPolicy), Marker: marker})
+		if err != nil {
+			return fmt.Errorf("listing the claim certificates (%s): %w", a.cfg.ClaimPolicy, err)
+		}
+		for _, target := range out.Targets {
+			i := strings.LastIndex(target, ":cert/")
+			if i < 0 {
+				continue
+			}
+			id := target[i+len(":cert/"):]
+			_, err := a.iot.UpdateCertificate(ctx, &iot.UpdateCertificateInput{
+				CertificateId: aws.String(id),
+				NewStatus:     iottypes.CertificateStatusInactive,
+			})
+			if err != nil {
+				errs = append(errs, fmt.Errorf("deactivating the claim certificate %s: %w", id, err))
+				continue
+			}
+			slog.Info("Claim certificate INACTIVE", "certificate", id)
+		}
+		if aws.ToString(out.NextMarker) == "" {
+			return errors.Join(errs...)
+		}
+		marker = out.NextMarker
+	}
 }
 
 // Handler processes the SNS records. A failure is returned so Lambda retries

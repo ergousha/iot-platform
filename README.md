@@ -26,17 +26,21 @@ graph TD
     subgraph AWS ["AWS IoT Cloud Infrastructure"]
         OIDC[IAM OIDC Provider] <-->|Authenticate| GH
         S3_Firmware[(S3 Firmware Bucket)]
-        GH -->|Upload firmware.bin| S3_Firmware
+        GH -->|Upload signed release| S3_Firmware
         
         S3_State[(S3 TF State Bucket)]
         
-        SSM[SSM Parameter Store]
+        SSM[SSM: signing keys, claim, guard]
         
-        Lambda_OTA[Lambda: ota_trigger]
-        S3_Firmware -->|S3 Event: ObjectCreated| Lambda_OTA
+        Lambda_OTA[Lambda: ota_controller]
+        Sched[Scheduler: every 15 min] --> Lambda_OTA
+        S3_Firmware -->|S3 Event: manifest.sig| Lambda_OTA
+        Lambda_OTA <--> SSM
+        CF[CloudFront Free plan]
+        S3_Firmware -->|releases/*, OAC| CF
         
         IoT[AWS IoT Core]
-        Lambda_OTA -->|Create Job| IoT
+        Lambda_OTA -->|Canary / fleet jobs, claim| IoT
         
         Lambda_ZTP[Lambda: pre-provisioning-hook]
         IoT -->|Invoke Hook| Lambda_ZTP
@@ -53,7 +57,7 @@ graph TD
     ESP -->|2. Get Unique Cert| IoT
     ESP -->|3. Reconnect with Device Cert| IoT
     ESP -->|4. Poll OTA Jobs| IoT
-    ESP -->|5. Download Firmware| S3_Firmware
+    ESP -->|5. Download Firmware| CF
 ```
 
 ---
@@ -137,105 +141,82 @@ Write access to this table is effectively the right to enrol a device: keep it t
 
 ### Enrolling a Device
 
-1. Register it: write its record with `provisioned = false` (the `put-item` above, or the gateway repo's `seed-device`).
-2. Open a window and power the device: `scripts/claim-window.sh 30`. The device enrols within a couple of minutes; the window closes itself (on time, on Ctrl-C, or when the shell exits). The script is the only thing that closes it: if the laptop dies mid-window, run `aws iot update-certificate --new-status INACTIVE` on the claim, or `terraform apply`. Setting `enrol_by` on the record (Unix seconds, e.g. `$(( $(date +%s) + 3600 ))`) bounds the record's own window server-side.
+Use `ergo commission` from [iot-device-sdk](https://github.com/ergousha/iot-device-sdk): it registers the device (with `enrol_by`), writes the claim and Wi-Fi over the serial console, arms the claim for the window and disarms it afterwards. If the laptop dies mid-window, the OTA controller's next tick disarms the claim once `enrol_by` has passed. `scripts/claim-window.sh` remains for a manual enrolment of a registered device.
 
-To **re-enrol** a device (a new key, erased NVS), register it again: writing the record with `provisioned = false` is what allows one more enrolment. Its old certificate stays attached to the thing until you deactivate it.
+To **re-enrol** a device (a new key, erased NVS), use `ergo commission --reprovision`: writing the record with `provisioned = false` allows one more enrolment. The controller deactivates and detaches the old certificate once the device has connected with the new one.
 
 ---
 
 ## 3. Firmware Release & OTA Flow
 
-The platform provides automatic, event-driven OTA updates triggered when a new firmware binary is uploaded to Amazon S3. Each upload becomes one AWS IoT Job for **its product's canary thing group**, stopped automatically when a canary fails. Once the canaries succeeded, `scripts/promote.sh <product>` creates the same job for the product's **fleet** group (the canaries are part of it too and settle without a download). The promote step becomes automatic in a later phase of the platform plan.
+Releases are fully automated (platform plan §5b). A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub pre-release and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
 
-### Firmware Keys and Routing
+### What a release uploads
 
-| Uploaded key | Product | Job ID |
-| :--- | :--- | :--- |
-| `<product>/firmware_vX.Y.Z.bin`, e.g. `vaktus/firmware_v0.8.0.bin` | `<product>` | `ota-<product>-firmware_vX-Y-Z-<upload ms>` |
-| `firmware_vX.Y.Z.bin` at the bucket root (where releases went before products) | the legacy product, `gateway` | `ota-gateway-…` |
-| anything else (an unknown prefix, a deeper path) | none: logged and ignored | — |
-
-Each product's GitHub Actions role may only write under its own prefix (the gateway also at the root, until its release workflow moves to `gateway/`). The job document carries `"product": "<id>"` next to `operation`, `firmware_version` and `download_url`, so firmware can refuse an image meant for another product; older firmware ignores the field.
-
-### OTA Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Developer
-    participant GitHub as GitHub Actions (CI/CD)
-    participant OIDC as AWS IAM (OIDC)
-    participant S3 as Amazon S3
-    participant Lambda as AWS Lambda (ota_trigger)
-    participant IoT as AWS IoT Core (Jobs)
-    participant Device as ESP32 Device (Rust)
-
-    Developer->>GitHub: Push tagged commit / Merge PR to main
-    GitHub->>GitHub: Build ELF & package firmware.bin
-    GitHub->>OIDC: Request temporary credentials via OIDC
-    OIDC-->>GitHub: Temporary AWS credentials
-    GitHub->>S3: Upload firmware.bin (key: <product>/firmware_vX.Y.Z.bin)
-    S3->>Lambda: Trigger s3:ObjectCreated notification
-    Lambda->>IoT: Create CONTINUOUS job for the product's canary thing group<br/>(rollout, abort, timeout & presigned-URL config)
-    Lambda->>IoT: Cancel the product's older ota-* jobs (canary and fleet)
-    Note over IoT: Notify devices at the rollout rate,<br/>faster as executions succeed
-    IoT-->>Device: Notify via $aws/things/{thingName}/jobs/notify-next
-    Device->>IoT: Request job details via $aws/things/{thingName}/jobs/$next/get
-    Note over IoT: Replace the download_url placeholder with a<br/>1-hour pre-signed GET URL (ota-presign role)
-    IoT-->>Device: Return job document containing pre-signed URL & version
-    Note over Device: Mark Job IN_PROGRESS (in-progress timeout starts)
-    Device->>S3: Perform HTTP GET on pre-signed URL
-    S3-->>Device: Stream binary payload
-    Note over Device: Write binary block-by-block to inactive OTA partition
-    Device->>IoT: Mark Job SUCCEEDED / FAILED
-    Device->>Device: Reboot (esp_restart)
-    Note over Device: Booting into new partition (Pending Verification)
-    Device->>IoT: Attempt TLS MQTT connection using unique certificate
-    IoT-->>Device: Connection successful
-    Note over Device: Run verification checklist & call<br/>esp_ota_mark_app_valid_cancel_rollback()
+```
+s3://esp32-ztp-firmware-<account>/releases/<product>/<X.Y.Z>/
+    app.bin  factory.bin  manifest.json  manifest.sig   (manifest.sig last)
 ```
 
-The firmware currently reports SUCCEEDED right after the download, before it reboots. [esp32-opcua-gateway-rust#14](https://github.com/ergousha/esp32-opcua-gateway-rust/issues/14) moves that report to the new image, after it has marked itself valid, and reports a rollback as FAILED. From then on, the abort and timeout settings below count real outcomes.
+`manifest.json` is canonical JSON `{contract, factory_sha256, product, sha256, size, version}` and `manifest.sig` is `base64(DER(ECDSA-P256-SHA256(manifest.json)))`, made with the product's signing key (GitHub Environment `release`). Each product's GitHub OIDC role may write only `releases/<product>/*`, only from Environment `release`, and only inside the SDK workflow ([iam_github_oidc.tf](iam_github_oidc.tf)). Uploads use `If-None-Match: *`: a published release is never overwritten.
 
-### Thing Groups
+The images are public through CloudFront ([cloudfront.tf](cloudfront.tf)): `https://<distribution>/<product>/<X.Y.Z>/app.bin`. Images carry no secrets, so no presigned URLs: the job document holds a stable URL, and a device's Range resume survives reboots.
 
-| Product | Fleet group (`promote.sh` target) | Canary group (child of fleet; release target) | Provisioning template |
-| :--- | :--- | :--- | :--- |
-| `gateway` | `esp32-ztp-fleet` | `esp32-ztp-canary` (bench unit `28848553144F`) | `esp32-s3-fleet-template` |
-| `vaktus` | `esp32-ztp-vaktus-fleet` | `esp32-ztp-vaktus-canary` (bench unit `38182B8456F4`) | `esp32-ztp-vaktus-fleet-template` |
+### The controller
 
-The gateway keeps the names it had before products existed (pinned in `products.gateway`); new products get `esp32-ztp-<id>-…` names. A product's template puts every device it registers into the product's fleet group and sets the thing attribute `product`. Every release goes to the canary group first; the canary group also receives every promoted fleet job.
+It runs every 15 minutes (the source of truth), on the S3 event of each `manifest.sig` (the same, sooner), and on owner overrides. Per product:
 
-AWS IoT allows a thing in only one group of a hierarchy. A device provisioned since its fleet group existed is already in it, so to make it a canary, remove it from the fleet group first, then add it to `products.<id>.canary_things` and apply:
+| Step | Rule |
+| :--- | :--- |
+| Verify | Every version above `fleet_version` is checked against SSM `/iot-platform/products/<product>/signing_keys` (key id → PEM): canonical manifest, a valid signature, the product and version it names equal to its path, `app.bin` of the manifest's size. A refused release is emailed once and never rolled out. |
+| Desired | The highest verified version above `fleet_version` that is not `halted_version`. A newer version clears a halt. A version arriving mid-soak cancels the older canary job (not a halt). |
+| Canary | A SNAPSHOT job `ota-<p>-<X_Y_Z>-c` on the canary group. No canary online: an online fleet device is moved in (registry `canary=true` first, else the lowest thing name), with an email; nobody online: wait, one email. A canary QUEUED for 2 h is moved back to the fleet and substituted (`-c-rN`). A product with one device goes straight to the fleet job. |
+| Halt | A FAILED or REJECTED canary execution sets `halted_version` and cancels the job. Exception: reason `download` gets one rerun (`-c-r1`). |
+| Soak gate | Every canary succeeded, is online, and its `platform` shadow, reported after the update, shows the new `fw` with `boot_count_since_update == 1`. A crash `boot_reason` (panic, watchdogs) halts. A reconnect restarts the soak; a non-crash reboot blocks it (one email; `promote` overrides). Soak: `soak_hours` (6 h; vaktus 24 h). |
+| Promote | `auto`: a CONTINUOUS fleet job `ota-<p>-<X_Y_Z>-f`, `fleet_version` set, and only then the previous fleet job cancelled. `hold`: one "ready to promote" email. |
+| Fleet failures | One failed device while others succeed: moved to the excluded group, email. Two or more: the fleet job is cancelled and the version halted. |
+| Done | One "fleet on X.Y.Z" email. |
+| Legacy | Jobs of the old `ota_trigger` (`ota-<p>-firmware_v…-<ms>`) are cancelled: their presigned URLs died with it. |
+
+Job documents always carry the v1 fields (`operation`, `product`, `firmware_version`, `download_url`) and `contract: 1`. They also carry `manifest`, `sig` and `key_id` once **every** target device reports that key id in its `platform` shadow: a device whose firmware has no keys yet would refuse a signed job, so it gets the v1 document while the controller has already checked the signature. Phase 6 (`signed-only`) ends that transition. Executions time out after `ota_in_progress_timeout_minutes` (60) with two retries; a FAILED execution is final.
+
+State lives in the attributes of the product's fleet group: `ota_mode` (`auto`, `hold`, `frozen`), `soak_hours`, `fleet_version`, `halted_version`, `halted_reason`, and `notified` (the one-off emails already sent). Terraform ignores them. Emails go to SNS `esp32-ztp-ota` (confirm its subscription mail once).
+
+### Owner overrides
+
 ```sh
-aws iot update-thing-groups-for-thing --thing-name <thing> --thing-groups-to-remove <fleet group>
+scripts/ota.sh status   vaktus
+scripts/ota.sh promote  vaktus [X.Y.Z]      # skip the soak gate
+scripts/ota.sh hold|resume|freeze vaktus
+scripts/ota.sh rerun    vaktus [X.Y.Z]      # canary again, clears that version's halt
+scripts/ota.sh rollback vaktus X.Y.Z        # downgrade:true fleet job; then on hold
+scripts/ota.sh target   vaktus <thing>      # back from excluded, with its own job
+scripts/ota.sh rotate-claim
 ```
-If a device provisions again, the template leaves its group membership as it is.
 
-### Job Configuration
+Only `rollback` downgrades, and only to a verified version; the tick never does. The same actions go through the controller's `AWS_IAM` Function URL (`terraform output ota_controller_function_url`) for the portal (Phase 4). Overrides that create jobs are refused while the guard is tripped.
 
-| Setting | Terraform variable | Default |
-| :--- | :--- | :--- |
-| Rollout starts at | `ota_rollout_base_rate_per_minute` | 1 device per minute |
-| ... and is multiplied by | `ota_rollout_increment_factor` | 2 |
-| ... each time this many more devices succeed | `ota_rollout_succeeded_things` | 5 |
-| ... up to | `ota_rollout_max_per_minute` | 20 devices per minute |
-| Cancel the job when this share of executions ended FAILED, TIMED_OUT or REJECTED | `ota_abort_failure_percentage` | 20 % |
-| ... counted once this many devices have been notified | `ota_abort_min_executed_things` | 1 (a single failed canary stops the release) |
-| An execution still IN_PROGRESS after this becomes TIMED_OUT | `ota_in_progress_timeout_minutes` | 30 minutes |
+### Thing groups
 
-Terraform validates these against the ranges the AWS IoT API accepts, and passes them to the Lambda as environment variables. The Lambda checks them again and refuses to start if any is missing or invalid, rather than create a job without its brakes. `aws iot describe-job --job-id <id>` shows the configuration of a created job.
+| Product | Fleet group (state, fleet job) | Canary group (child of fleet) | Excluded group | Template |
+| :--- | :--- | :--- | :--- | :--- |
+| `gateway` | `esp32-ztp-fleet` | `esp32-ztp-canary` | `esp32-ztp-gateway-excluded` | `esp32-s3-fleet-template` |
+| `vaktus` | `esp32-ztp-vaktus-fleet` | `esp32-ztp-vaktus-canary` | `esp32-ztp-vaktus-excluded` | `esp32-ztp-vaktus-fleet-template` |
 
-### One Release in Flight
+A thing is in one group of a hierarchy, so canaries and the rest of the fleet are disjoint, and canaries also get the fleet job (they settle it without a download). Canary membership is the controller's: mark a device with `canary=true` in the registry (`ergo commission --canary`) and the next tick moves it in. The fleet kill switch cuts off fleet and excluded groups alike.
 
-The job is **CONTINUOUS**, so a device that joins the group later still receives it. A continuous job never completes, though, and a device that joined would receive every older release still active, oldest first. So after creating its job, the Lambda cancels the older `ota-*` jobs that target the same product's canary group. Listing a child group's jobs also returns the jobs aimed at its parent; the Lambda reads each job's targets and leaves those fleet jobs alone, so the fleet keeps its last promoted release (for devices that join or come back online) until `promote.sh` replaces it. `promote.sh` cancels the product's older fleet jobs. Other products' groups are never touched. It does not force the cancellation: queued executions are dropped, while a device already mid-update finishes and then takes the new job.
+### Presence
 
-The job ID is `ota-<product>-<version>-<upload time in ms>`, taken from the S3 event rather than the clock. A redelivered or retried event therefore maps to the job it already created, and "older" means an earlier upload even when invocations run out of order. A failed invocation returns an error, so Lambda retries it; the retry finds the job and finishes the cancellation. Uploading the same file again is a new upload: it creates a new job, which the whole group receives again.
+A rule writes every connect and disconnect lifecycle event into `esp32-ztp-device-presence` ([presence.tf](presence.tf)), one item per thing and event type. The controller reads it for the canary choice and the soak gate, and to tell which certificate a re-enrolled device now uses.
 
-### Download URLs
+### The claim
 
-The job document keeps its fields (`operation`, `firmware_version`, `download_url`), but `download_url` holds an AWS IoT placeholder. Each time a device requests the document, AWS IoT replaces it with a pre-signed GET URL valid for an hour, signed as the `esp32-ztp-ota-presign-role`. A device that joins months after the upload, or is reached late in a slow rollout, never gets an expired URL.
+The claim certificate is no longer in Terraform. The controller:
+
+* keeps it ACTIVE only while a registry record has an open window (`allowed`, not `provisioned`, `enrol_by` in the future) and the guard is clear. `ergo commission` arms and disarms bench windows itself; site windows (`ergo register --minutes`, up to a week) are armed by the tick;
+* rotates it after a site window, when asked (`scripts/ota.sh rotate-claim`), and whenever SSM and the claim policy disagree: a P-256 key generated in memory, `CreateCertificateFromCsr`, the claim policy attached, `/iot-platform/claim/{cert,key}` (SecureString) written, the old certificate deactivated and deleted;
+* hourly, deletes certificates attached to no thing for over a day, and deactivates the older certificate of a re-enrolled thing once presence shows it connecting with the new one;
+* hourly, emails about a GitHub pre-release over an hour old whose manifest never reached S3.
 
 ---
 
@@ -265,8 +246,7 @@ region = eu-central-1
 ```sh
 aws-vault add ergin                                     # once: stores the key in the keychain
 aws-vault exec ergousha-admin -- terraform apply        # asks for the MFA code, 12-hour session
-aws-vault exec ergousha-admin -- scripts/promote.sh vaktus
-aws-vault exec ergin -- cargo build --release           # firmware builds only read SSM
+aws-vault exec ergousha-admin -- scripts/ota.sh status vaktus
 ```
 
 ### Terraform Deployment
@@ -296,32 +276,23 @@ To simplify developer workflows, this repository is configured with VS Code Task
 *   **Terraform: Lint (TFLint)**: Audits Terraform configurations using `tflint`.
 
 ### SSM Parameter Store Integration
-Terraform automatically publishes the deployment outputs to the AWS Systems Manager (SSM) Parameter Store. You can read them directly using the AWS CLI or build tools, eliminating the need to parse Terraform state files manually:
 
-```sh
-# Fetch the AWS IoT ATS Endpoint
-aws ssm get-parameter --name "/esp32-ztp/poc/iot_endpoint" --query "Parameter.Value" --output text
-
-# Fetch a product's Provisioning Template Name
-aws ssm get-parameter --name "/esp32-ztp/poc/vaktus/provisioning_template_name" --query "Parameter.Value" --output text
-# (/esp32-ztp/poc/provisioning_template_name is the gateway's, kept until its build.rs reads /esp32-ztp/poc/gateway/...)
-
-# Fetch the Claim Certificate (SecureString - Decrypted)
-aws ssm get-parameter --name "/esp32-ztp/poc/claim_certificate_pem" --with-decryption --query "Parameter.Value" --output text
-
-# Fetch the Claim Private Key (SecureString - Decrypted)
-aws ssm get-parameter --name "/esp32-ztp/poc/claim_private_key" --with-decryption --query "Parameter.Value" --output text
-```
+| Parameter | Written by | Read by |
+| :--- | :--- | :--- |
+| `/esp32-ztp/poc/iot_endpoint`, `/esp32-ztp/poc/<product>/provisioning_template_name` | Terraform | anyone (public facts; builds compile them from `platform.toml` now) |
+| `/esp32-ztp/guard/state` | the kill switch, `guard-reset.sh` | the controller, `ergo`, `claim-window.sh` |
+| `/iot-platform/products/<product>/signing_keys` (JSON: key id → public key PEM) | the owner, when creating or rotating signing keys (no Terraform) | the controller |
+| `/iot-platform/claim/{cert,key}` (SecureString), `/iot-platform/claim/state` | the controller | `ergo commission` only |
 
 ### Secure GitHub Actions OIDC Trust
 This infrastructure uses AWS IAM Identity Federation via OpenID Connect (OIDC) to grant secure access to GitHub Actions runners without requiring long-lived AWS secrets to be saved in GitHub.
 
-Each product has its own role, trusted only by its repository's `main` branch ([iam_github_oidc.tf](iam_github_oidc.tf)). It may upload firmware under its own bucket prefix and read the shared endpoint and claim parameters plus its own template parameter, nothing else:
+Each product has its own role ([iam_github_oidc.tf](iam_github_oidc.tf)), trusted only by its repository's Environment `release` (`sub = repo:<owner>@<id>/<repo>@<id>:environment:release`) and only inside the SDK's reusable release workflow (`job_workflow_ref`). It may put and get `releases/<product>/*`, nothing else: no SSM, no IoT.
 
-| Product | Role (the repository's `AWS_ROLE_ARN` variable) | May upload to |
+| Product | Role (the repository's `AWS_ROLE_ARN` variable) | May write |
 | :--- | :--- | :--- |
-| `gateway` | `esp32-ztp-github-actions-role` | `gateway/*`, and `firmware_*` at the root until its release moves |
-| `vaktus` | `esp32-ztp-vaktus-github-actions-role` | `vaktus/*` |
+| `gateway` | `esp32-ztp-github-actions-role` | `releases/gateway/*` |
+| `vaktus` | `esp32-ztp-vaktus-github-actions-role` | `releases/vaktus/*` |
 
 `terraform output github_actions_role_arns` lists them. To add a product, add an entry to the `products` variable in [variables.tf](variables.tf) (its repository's numeric id: `gh api repos/<owner>/<repo> --jq .id`) and apply.
 
@@ -343,9 +314,9 @@ Denial-of-wallet is the main threat to a self-funded platform. [guard.tf](guard.
 
 The measured baseline was at most 48 publishes and 4 connects per 5 minutes. Each scope includes the ones above it:
 
-* **provisioning**: the claim certificate goes INACTIVE.
-* **traffic**: the telemetry → CloudWatch Logs rules are disabled.
-* **fleet**: the deny-all policy `esp32-ztp-guard-deny-all` is attached to every fleet group. Every device is refused on its next publish or connect, so the fleet goes offline and messaging cost stops.
+* **provisioning**: the claim certificate (every target of the claim policy) goes INACTIVE.
+* **traffic**: the telemetry → CloudWatch Logs rules and the presence rule are disabled (while it lasts, the soak gate sees no reconnects).
+* **fleet**: the deny-all policy `esp32-ztp-guard-deny-all` is attached to every fleet and excluded group. Every device is refused on its next publish or connect, so the fleet goes offline and messaging cost stops.
 
 Every trip is recorded in the SSM parameter `/esp32-ztp/guard/state`. `claim-window.sh` refuses to open a window while it is tripped. Once you know why it tripped:
 
@@ -386,6 +357,8 @@ All resources deployed in this repository are serverless and billed purely on-de
 | **AWS Lambda** | per invocation & duration | Billed per millisecond; free tier covers PoC |
 | **Amazon S3** | per GB-month & requests | Storage cost for binaries is fractions of a cent |
 | **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; telemetry routing off by default |
+| **CloudFront** (firmware) | Free flat-rate plan | $0, no overage (attach the plan in the console after the first apply; see [cloudfront.tf](cloudfront.tf)) |
+| **EventBridge Scheduler** | 2,976 ticks a month | $0 (14M free invocations) |
 | **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: 8 of the 10 free alarm metrics, a handful of messages, budgets without actions |
 
 Telemetry is not routed to CloudWatch Logs by default (`debug_telemetry_logs = false`): every message would be billed as a rule, an action and Logs ingestion. Turn it on for a debugging session or a gateway HIL run (`terraform apply -var debug_telemetry_logs=true`), and off again afterwards.

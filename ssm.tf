@@ -36,16 +36,5 @@ moved {
   to   = aws_ssm_parameter.provisioning_template[0]
 }
 
-resource "aws_ssm_parameter" "claim_certificate" {
-  name        = "/esp32-ztp/poc/claim_certificate_pem"
-  type        = "SecureString"
-  value       = aws_iot_certificate.claim.certificate_pem
-  description = "Bootstrap claim certificate"
-}
-
-resource "aws_ssm_parameter" "claim_private_key" {
-  name        = "/esp32-ztp/poc/claim_private_key"
-  type        = "SecureString"
-  value       = aws_iot_certificate.claim.private_key
-  description = "Bootstrap claim private key"
-}
+# The claim certificate and key are in /iot-platform/claim/{cert,key},
+# written by the OTA controller (see iot.tf), never by Terraform.

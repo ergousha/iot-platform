@@ -43,7 +43,15 @@ locals {
   guard_killable_rules = [
     aws_iot_topic_rule.telemetry_to_logs.name,
     aws_iot_topic_rule.opcua_telemetry_to_logs.name,
+    aws_iot_topic_rule.presence.name,
   ]
+
+  # Every group whose devices the fleet scope cuts off. Canary groups inherit
+  # from their fleet group; excluded groups are outside that hierarchy.
+  guard_fleet_group_arns = concat(
+    [for g in aws_iot_thing_group.fleet : g.arn],
+    [for g in aws_iot_thing_group.excluded : g.arn],
+  )
 
   # Publishes over MQTT and HTTPS together: a device certificate works for both.
   guard_publish_metrics = {
@@ -219,9 +227,16 @@ resource "aws_iam_role_policy" "kill_switch" {
         Resource = "${aws_cloudwatch_log_group.kill_switch.arn}:*"
       },
       {
+        # The claim is whatever the claim policy is attached to (the OTA
+        # controller rotates it); the code only ever sets INACTIVE.
+        Effect   = "Allow"
+        Action   = "iot:ListTargetsForPolicy"
+        Resource = aws_iot_policy.claim.arn
+      },
+      {
         Effect   = "Allow"
         Action   = "iot:UpdateCertificate"
-        Resource = aws_iot_certificate.claim.arn
+        Resource = "${local.iot_arn}:cert/*"
       },
       {
         Effect   = "Allow"
@@ -229,12 +244,12 @@ resource "aws_iam_role_policy" "kill_switch" {
         Resource = [for r in local.guard_killable_rules : "${local.iot_arn}:rule/${r}"]
       },
       {
-        # AttachPolicy is authorised against the target; only the fleet
-        # groups, and only this one policy can be attached (the API call names
-        # it, and the role cannot create policies).
+        # AttachPolicy is authorised against the target; only the fleet and
+        # excluded groups, and only this one policy can be attached (the API
+        # call names it, and the role cannot create policies).
         Effect   = "Allow"
         Action   = "iot:AttachPolicy"
-        Resource = concat([for g in aws_iot_thing_group.fleet : g.arn], [aws_iot_policy.guard_deny_all.arn])
+        Resource = concat(local.guard_fleet_group_arns, [aws_iot_policy.guard_deny_all.arn])
       },
       {
         Effect   = "Allow"
@@ -260,10 +275,10 @@ resource "aws_lambda_function" "kill_switch" {
     variables = {
       ALARM_SCOPES          = jsonencode(local.guard_alarm_scopes)
       BUDGET_SCOPES         = jsonencode(local.guard_budget_scopes)
-      CLAIM_CERTIFICATE_ID  = aws_iot_certificate.claim.id
+      CLAIM_POLICY          = aws_iot_policy.claim.name
       KILLABLE_RULES        = jsonencode(local.guard_killable_rules)
       DENY_POLICY           = aws_iot_policy.guard_deny_all.name
-      FLEET_GROUP_ARNS      = jsonencode([for g in aws_iot_thing_group.fleet : g.arn])
+      FLEET_GROUP_ARNS      = jsonencode(local.guard_fleet_group_arns)
       GUARD_STATE_PARAMETER = aws_ssm_parameter.guard_state.name
     }
   }
@@ -365,7 +380,7 @@ resource "aws_cloudwatch_metric_alarm" "hook" {
 
 resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
   for_each = {
-    "${local.guard_prefix}-ota-errors"         = aws_lambda_function.ota_trigger.function_name
+    "${local.guard_prefix}-ota-errors"         = aws_lambda_function.ota_controller.function_name
     "${local.guard_prefix}-kill-switch-errors" = aws_lambda_function.kill_switch.function_name
   }
 
