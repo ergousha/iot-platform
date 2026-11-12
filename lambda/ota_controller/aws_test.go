@@ -195,6 +195,10 @@ func testConfig() Config {
 		ClaimCertParameter: "/iot-platform/claim/cert", ClaimKeyParameter: "/iot-platform/claim/key",
 		ClaimStateParameter:      "/iot-platform/claim/state",
 		InProgressTimeoutMinutes: 60,
+		Quarantine:               Group{Name: "esp32-ztp-quarantine", ARN: "arn:aws:iot:eu-central-1:111122223333:thinggroup/esp32-ztp-quarantine"},
+		DenyPolicy:               "deny-all",
+		RestoreRules:             []string{"esp32_ztp_presence"},
+		ViewerRoles:              []string{"esp32-ztp-portal-viewer"},
 	}
 }
 
@@ -424,6 +428,8 @@ func TestLoadConfig(t *testing.T) {
 		"NOTIFY_TOPIC_ARN": "arn:aws:sns:eu-central-1:1:t", "IOT_DATA_ENDPOINT": "x-ats.iot.eu-central-1.amazonaws.com",
 		"OTA_ROLLOUT_BASE_RATE_PER_MINUTE": "1", "OTA_ROLLOUT_INCREMENT_FACTOR": "2", "OTA_ROLLOUT_SUCCEEDED_THINGS": "5",
 		"OTA_ROLLOUT_MAX_PER_MINUTE": "20", "OTA_IN_PROGRESS_TIMEOUT_MINUTES": "60",
+		"QUARANTINE_GROUP_ARN": "arn:aws:iot:eu-central-1:1:thinggroup/q", "DENY_POLICY": "d",
+		"RESTORE_RULES": `["r"]`, "VIEWER_ROLES": `[]`,
 		"PRODUCTS": `{"vaktus":{"fleet_group_arn":"` + vaktus.Fleet.ARN + `","canary_group_arn":"` + vaktus.Canary.ARN +
 			`","excluded_group_arn":"` + vaktus.Excluded.ARN + `","repository":"ergousha/x","soak_hours":24}}`,
 	}
@@ -431,14 +437,18 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if c.Quarantine.Name != "q" || len(c.RestoreRules) != 1 || len(c.ViewerRoles) != 0 {
+		t.Errorf("guard config %+v", c)
+	}
 	if c.Products["vaktus"].Canary.Name != "esp32-ztp-vaktus-canary" || c.downloadURL(c.Products["vaktus"], ver("1.2.3")) != "https://d.cloudfront.net/vaktus/1.2.3/app.bin" {
 		t.Errorf("config %+v", c)
 	}
 	env["DOWNLOAD_URL_TEMPLATE"] = "http://insecure/{version}"
 	env["PRODUCTS"] = `{"Bad":{}}`
 	delete(env, "CLAIM_POLICY")
+	env["VIEWER_ROLES"] = "viewer"
 	_, err = loadConfig(func(k string) string { return env[k] })
-	for _, want := range []string{"DOWNLOAD_URL_TEMPLATE", "Bad", "CLAIM_POLICY"} {
+	for _, want := range []string{"DOWNLOAD_URL_TEMPLATE", "Bad", "CLAIM_POLICY", "VIEWER_ROLES"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %s in %v", want, err)
 		}

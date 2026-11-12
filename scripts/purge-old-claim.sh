@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# One-off cleanup after the Phase 3 apply (platform plan §9): removes every
-# copy of the old claim (and the gateway's compiled-in Wi-Fi) that AWS still
-# holds.
+# One-off cleanup after the claim moved to the OTA controller: removes every
+# copy of the old Terraform-made claim (and the gateway's compiled-in
+# Wi-Fi) that AWS still holds.
 #
-#   scripts/purge-pre-phase3.sh            show what would be deleted
-#   scripts/purge-pre-phase3.sh --delete   delete it (asks once more)
+#   scripts/purge-old-claim.sh            show what would be deleted
+#   scripts/purge-old-claim.sh --delete   delete it (asks once more)
 #
 # 1. The firmware bucket: every object (and object version) outside
-#    releases/. Pre-Phase 3 images carry the claim, the gateway's also the
-#    Wi-Fi PSK, and they were served only through the now-deleted presign role.
+#    releases/. Images from before the move carry the claim, the gateway's
+#    also the Wi-Fi PSK, and they were served only through the now-deleted
+#    presign role.
 # 2. The Terraform state: every noncurrent version of the state object. Older
 #    states hold the claim's private key (aws_iot_certificate.claim and the
 #    SSM parameters). It refuses unless the CURRENT state holds no private key,
-#    i.e. unless the Phase 3 apply (which drops the claim from the state) ran.
+#    i.e. unless the apply that drops the claim from the state ran.
 #
 # Run it after the controller has rotated the claim (scripts/ota.sh status
 # shows nothing; the "claim rotated" email arrived), so the deleted copies
@@ -50,7 +51,7 @@ current=$(mktemp)
 trap 'rm -f "$current"' EXIT
 aws s3 cp --quiet "s3://$state_bucket/$state_key" "$current"
 if grep -q 'PRIVATE KEY' "$current"; then
-  echo "refusing: the current state still holds a private key. Run the Phase 3 terraform apply first." >&2
+  echo "refusing: the current state still holds a private key. Run terraform apply first." >&2
   exit 1
 fi
 noncurrent=$(aws s3api list-object-versions --bucket "$state_bucket" --prefix "$state_key" --output json |

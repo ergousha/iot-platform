@@ -1,5 +1,5 @@
 // Command ota_controller is the platform's release pipeline and claim
-// lifecycle, replacing the ota_trigger Lambda (platform plan, Phase 3).
+// lifecycle, replacing the ota_trigger Lambda.
 //
 // It runs on three triggers:
 //
@@ -9,7 +9,7 @@
 //   - the S3 ObjectCreated event of releases/<p>/<X.Y.Z>/manifest.sig, the
 //     last object a release uploads: a tick of that product, right away;
 //   - owner overrides: `aws lambda invoke` (scripts/ota.sh) or the AWS_IAM
-//     Function URL (the portal, Phase 4).
+//     Function URL (the portal; its viewer role may only read status).
 //
 // Per product, a tick verifies new releases against the product's signing
 // keys, runs the newest through a canary job and a soak gate, promotes it to
@@ -61,6 +61,14 @@ type event struct {
 		HTTP *struct {
 			Method string `json:"method"`
 		} `json:"http"`
+		Authorizer *struct {
+			IAM *struct {
+				Caller
+				CognitoIdentity *struct {
+					IdentityID string `json:"identityId"`
+				} `json:"cognitoIdentity"`
+			} `json:"iam"`
+		} `json:"authorizer"`
 	} `json:"requestContext"`
 	Body            string `json:"body"`
 	IsBase64Encoded bool   `json:"isBase64Encoded"`
@@ -137,6 +145,18 @@ func (a *App) functionURL(ctx context.Context, ev event) events.LambdaFunctionUR
 	if err := json.Unmarshal(body, &o); err != nil || o.Action == "" || o.Action == "tick" {
 		return respond(http.StatusBadRequest, Result{Error: "body must be an override: {\"action\":...,\"product\":...}"})
 	}
+	var caller Caller
+	if az := ev.RequestContext.Authorizer; az != nil && az.IAM != nil {
+		caller = az.IAM.Caller
+		if az.IAM.CognitoIdentity != nil {
+			caller.IdentityID = az.IAM.CognitoIdentity.IdentityID
+		}
+	}
+	if err := a.allowed(caller, o); err != nil {
+		slog.Warn("Override refused", "action", o.Action, "caller", caller.String(), "error", err)
+		return respond(http.StatusForbidden, Result{Error: err.Error()})
+	}
+	o.by = caller.String()
 	r := a.override(ctx, o)
 	if !r.OK {
 		return respond(http.StatusBadRequest, r)
@@ -211,7 +231,20 @@ func (a *App) override(ctx context.Context, o Override) Result {
 		slog.Error("Override failed", "action", o.Action, "product", o.Product, "error", err)
 		return Result{Error: err.Error()}
 	}
-	slog.Info("Override", "override", o)
+	slog.Info("Override", "override", o, "by", o.by)
+	// An action that did its work but could not email still succeeded.
+	done := func(r Result, err error) Result {
+		switch {
+		case err == nil:
+			return r
+		case r.OK:
+			r.Error = err.Error()
+			return r
+		}
+		f := fail(err)
+		f.Log = r.Log
+		return f
+	}
 
 	switch o.Action {
 	case "tick":
@@ -229,11 +262,19 @@ func (a *App) override(ctx context.Context, o Override) Result {
 			return fail(err)
 		}
 		return Result{OK: true, Log: []string{"claim rotated"}}
+	case "guard-reset":
+		return done(a.guardReset(ctx, o.by))
 	}
 
 	p, ok := a.cfg.Products[o.Product]
 	if !ok {
 		return fail(fmt.Errorf("unknown product %q", o.Product))
+	}
+	switch o.Action {
+	case "quarantine", "unquarantine":
+		return done(a.quarantine(ctx, p, o))
+	case "decommission":
+		return done(a.decommission(ctx, p, o))
 	}
 	if o.createsJobs() {
 		guard, err := a.guard(ctx)
@@ -256,6 +297,7 @@ func (a *App) override(ctx context.Context, o Override) Result {
 	if err != nil {
 		return fail(err)
 	}
+	plan = attribute(plan, o.by)
 	if err := a.execute(ctx, s, meta, plan); err != nil {
 		return fail(err)
 	}

@@ -52,6 +52,12 @@ type IoTAPI interface {
 	ListThings(context.Context, *iot.ListThingsInput, ...func(*iot.Options)) (*iot.ListThingsOutput, error)
 	ListThingPrincipals(context.Context, *iot.ListThingPrincipalsInput, ...func(*iot.Options)) (*iot.ListThingPrincipalsOutput, error)
 	DetachThingPrincipal(context.Context, *iot.DetachThingPrincipalInput, ...func(*iot.Options)) (*iot.DetachThingPrincipalOutput, error)
+
+	// Owner actions (admin.go).
+	AddThingToThingGroup(context.Context, *iot.AddThingToThingGroupInput, ...func(*iot.Options)) (*iot.AddThingToThingGroupOutput, error)
+	RemoveThingFromThingGroup(context.Context, *iot.RemoveThingFromThingGroupInput, ...func(*iot.Options)) (*iot.RemoveThingFromThingGroupOutput, error)
+	DeleteThing(context.Context, *iot.DeleteThingInput, ...func(*iot.Options)) (*iot.DeleteThingOutput, error)
+	EnableTopicRule(context.Context, *iot.EnableTopicRuleInput, ...func(*iot.Options)) (*iot.EnableTopicRuleOutput, error)
 }
 
 // ShadowAPI reads device shadows.
@@ -98,6 +104,7 @@ type App struct {
 	sns    SNSAPI
 	http   HTTPDoer
 	now    func() time.Time
+	sleep  func(time.Duration) // nil: time.Sleep
 }
 
 // ---------------------------------------------------------------------------

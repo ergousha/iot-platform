@@ -7,12 +7,18 @@ import (
 )
 
 // Override is an owner command: from scripts/ota.sh (direct invoke) or the
-// AWS_IAM Function URL (the portal, Phase 4).
+// AWS_IAM Function URL (the portal). Through the URL, the portal's viewer
+// role may only send status.
 type Override struct {
 	Action  string `json:"action"`
 	Product string `json:"product"`
 	Version string `json:"version,omitempty"`
 	Thing   string `json:"thing,omitempty"`
+	// Confirm repeats the thing name for decommission.
+	Confirm string `json:"confirm,omitempty"`
+
+	// by names a Function URL caller (set by the handler, never decoded).
+	by string
 }
 
 // createsJobs: refused while the guard is tripped.

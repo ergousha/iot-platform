@@ -1,0 +1,77 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'portal/package.json'
+      - 'portal/package-lock.json'
+      - '.github/workflows/security-audit.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+      - 'portal/package.json'
+      - 'portal/package-lock.json'
+      - '.github/workflows/security-audit.yml'
+  schedule:
+    # Weekly, Monday 00:00 UTC: advisories appear without a code change.
+    - cron: '0 0 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-audit-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: Go vulnerabilities (govulncheck)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: 'go.mod'
+          cache: false
+
+      # Reports only vulnerabilities in code the Lambdas actually call.
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+  npm:
+    name: Portal dependencies (npm audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install (lockfile only, no install scripts)
+        run: npm ci --ignore-scripts
+
+      # Known advisories, runtime and build dependencies alike.
+      - name: npm audit
+        run: npm audit
+
+      # Every package as published: registry signatures and provenance.
+      - name: npm audit signatures
+        run: npm audit signatures

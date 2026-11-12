@@ -128,7 +128,7 @@ func TestNewReleaseStartsASignedCanaryJob(t *testing.T) {
 func TestCanaryWithoutTheKeyGetsAnUnsignedJob(t *testing.T) {
 	s := fixture()
 	s.Releases = append(s.Releases, rel("0.9.2"))
-	s.Fleet["C1"].Shadow.KeyIDs = nil // Phase 2 firmware: empty keyring
+	s.Fleet["C1"].Shadow.KeyIDs = nil // older firmware: empty keyring
 	j := kinds(planTick(s), ActCreateJob)[0].Job
 	if j.Signed {
 		t.Error("a canary without the key would refuse a signed job (reason sig)")

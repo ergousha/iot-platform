@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Owner overrides of the OTA controller (the portal will offer the same).
+# Owner overrides of the OTA controller (the portal offers the same).
 #
 #   scripts/ota.sh status   <product>
 #   scripts/ota.sh promote  <product> [X.Y.Z]   fleet job now, skipping the soak gate
@@ -9,6 +9,10 @@
 #   scripts/ota.sh rerun    <product> [X.Y.Z]   run the canary again (clears that version's halt)
 #   scripts/ota.sh rollback <product> X.Y.Z     downgrade the fleet to a verified version (then on hold)
 #   scripts/ota.sh target   <product> <thing> [X.Y.Z]   one device: back from excluded, own job
+#   scripts/ota.sh quarantine   <product> <thing>   cut one device off (deny-all group)
+#   scripts/ota.sh unquarantine <product> <thing>   and back
+#   scripts/ota.sh decommission <product> <thing>   certificates INACTIVE, thing deleted (asks first)
+#   scripts/ota.sh guard-reset                  like guard-reset.sh, and re-enables the configured rules
 #   scripts/ota.sh rotate-claim                 new claim certificate now
 #   scripts/ota.sh tick                         reconcile now instead of at the next quarter hour
 #
@@ -18,13 +22,13 @@
 set -euo pipefail
 
 function_name="${OTA_CONTROLLER:-esp32-ztp-ota-controller}"
-usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 action="${1:-}"
 version_re='^[0-9]+\.[0-9]+\.[0-9]+$'
 product_re='^[a-z][a-z0-9]{1,15}$'
 case "$action" in
-  tick | rotate-claim)
+  tick | rotate-claim | guard-reset)
     [[ $# -eq 1 ]] || usage
     payload=$(jq -cn --arg a "$action" '{action: $a}')
     ;;
@@ -42,6 +46,15 @@ case "$action" in
     [[ ($# -eq 3 || $# -eq 4) && "$2" =~ $product_re && "$3" =~ ^[A-Za-z0-9_:-]{1,128}$ ]] || usage
     [[ $# -eq 3 || "$4" =~ $version_re ]] || usage
     payload=$(jq -cn --arg p "$2" --arg t "$3" --arg v "${4:-}" '{action: "target", product: $p, thing: $t} + (if $v == "" then {} else {version: $v} end)')
+    ;;
+  quarantine | unquarantine | decommission)
+    [[ $# -eq 3 && "$2" =~ $product_re && "$3" =~ ^[A-Za-z0-9_:-]{1,128}$ ]] || usage
+    confirm=""
+    if [[ "$action" == decommission ]]; then
+      read -r -p "Decommission $3 ($2)? Its certificates go INACTIVE and the thing is deleted. Type the thing name: " confirm
+    fi
+    payload=$(jq -cn --arg a "$action" --arg p "$2" --arg t "$3" --arg c "$confirm" \
+      '{action: $a, product: $p, thing: $t} + (if $c == "" then {} else {confirm: $c} end)')
     ;;
   *) usage ;;
 esac

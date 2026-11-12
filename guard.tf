@@ -46,6 +46,14 @@ locals {
     aws_iot_topic_rule.presence.name,
   ]
 
+  # The killable rules Terraform keeps enabled: what a guard reset through
+  # the OTA controller (the portal) re-enables. guard-reset.sh leaves this
+  # to the next apply.
+  guard_restore_rules = concat(
+    [aws_iot_topic_rule.presence.name],
+    var.debug_telemetry_logs ? [aws_iot_topic_rule.telemetry_to_logs.name, aws_iot_topic_rule.opcua_telemetry_to_logs.name] : [],
+  )
+
   # Every group whose devices the fleet scope cuts off. Canary groups inherit
   # from their fleet group; excluded groups are outside that hierarchy.
   guard_fleet_group_arns = concat(
@@ -98,7 +106,7 @@ data "aws_iam_policy_document" "guard_topic" {
     condition {
       test     = "ArnLike"
       variable = "aws:SourceArn"
-      values   = ["arn:aws:cloudwatch:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:alarm:${local.guard_prefix}-*"]
+      values   = ["arn:aws:cloudwatch:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:alarm:${local.guard_prefix}-*"]
     }
   }
 

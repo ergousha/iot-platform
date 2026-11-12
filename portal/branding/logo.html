@@ -1,0 +1,69 @@
+<!doctype html>
+<!--
+  Source of the sign-in page logos and the favicon (portal.tf, managed login
+  branding; the portal's public/favicon.ico). The same mark as the portal's
+  header. Regenerate with scripts/portal-branding.sh.
+  ?mode=light|dark  ?mark=1 (the square mark alone, for the favicon)
+  Cognito refuses header logos larger than 200x60 px ("Invalid file
+  dimension"), so the logo is drawn at that size, one pixel per pixel.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+      }
+      .logo {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: 200px;
+        height: 60px;
+        font: 650 21px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: #18202b;
+      }
+      .mark {
+        display: grid;
+        place-items: center;
+        width: 36px;
+        height: 36px;
+        border-radius: 10px;
+        background: #2459d6;
+        color: #ffffff;
+        font-size: 15px;
+        font-weight: 750;
+      }
+      .dark .logo {
+        color: #e6eaef;
+      }
+      .dark .mark {
+        background: #7ea6ff;
+        color: #171c23;
+      }
+      .only-mark .logo {
+        width: 64px;
+        height: 64px;
+      }
+      .only-mark .mark {
+        width: 64px;
+        height: 64px;
+        border-radius: 16px;
+        font-size: 27px;
+      }
+      .only-mark .word {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="logo"><span class="mark">IoT</span><span class="word">IoT platform</span></div>
+    <script>
+      const q = new URLSearchParams(location.search);
+      if (q.get("mode") === "dark") document.body.classList.add("dark");
+      if (q.get("mark")) document.body.classList.add("only-mark");
+    </script>
+  </body>
+</html>

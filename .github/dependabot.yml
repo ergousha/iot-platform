@@ -1,0 +1,78 @@
+version: 2
+# No labels set: Dependabot applies its own (dependencies + the ecosystem).
+updates:
+  # The portal's npm dependencies. The cooldown keeps a release out until it
+  # is two weeks old, the same rule the lockfile was built with: most
+  # malicious versions are caught and pulled within days.
+  - package-ecosystem: "npm"
+    directory: "/portal"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      prefix-development: "chore"
+      include: "scope"
+    groups:
+      aws-sdk:
+        patterns:
+          - "@aws-sdk/*"
+          - "@aws-crypto/*"
+          - "@smithy/*"
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+      build-tooling:
+        dependency-type: "development"
+
+  # The Lambdas' Go modules.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      aws-sdk-go:
+        patterns:
+          - "github.com/aws/*"
+
+  # The AWS provider (versions.tf and .terraform.lock.hcl).
+  - package-ecosystem: "terraform"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "03:00"
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # Actions, pinned by SHA.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
