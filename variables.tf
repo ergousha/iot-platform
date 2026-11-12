@@ -56,6 +56,14 @@ variable "products" {
     # Hours a release soaks on the canaries before the fleet job.
     soak_hours = optional(number, 6)
 
+    # The product's named shadow, where the portal owner may set desired
+    # state. Default: the product id.
+    shadow_name = optional(string)
+
+    # The product's name in the portal. Default: the repository name without
+    # its owner and a trailing -rust (esp32-opcua-gateway).
+    display_name = optional(string)
+
     # true: the device keeps its private key in a secure element and enrols with
     # a CSR. The pre-provisioning hook then requires the registry record's
     # public_key to match the key in the new certificate; the shared secret is
@@ -82,6 +90,7 @@ variable "products" {
       github_repository_id = 1302001123
       legacy               = true
 
+      shadow_name                = "opcua"
       fleet_group_name           = "esp32-ztp-fleet"
       canary_group_name          = "esp32-ztp-canary"
       provisioning_template_name = "esp32-s3-fleet-template"
@@ -92,7 +101,7 @@ variable "products" {
       github_repository    = "ergousha/esp32-display-vaktus-salat-rust"
       github_repository_id = 1290322529
       require_public_key   = true
-      # Prayer-time boundary bugs matter more than speed (plan §10).
+      # Prayer-time boundary bugs matter more than speed.
       soak_hours = 24
     }
   }
@@ -105,6 +114,11 @@ variable "products" {
   validation {
     condition     = alltrue([for p in values(var.products) : p.soak_hours >= 0 && p.soak_hours <= 168 && floor(p.soak_hours) == p.soak_hours])
     error_message = "soak_hours is a whole number of hours from 0 to 168."
+  }
+
+  validation {
+    condition     = alltrue([for p in values(var.products) : p.shadow_name == null || (can(regex("^[A-Za-z0-9_-]{1,64}$", coalesce(p.shadow_name, "x"))) && p.shadow_name != "platform")])
+    error_message = "shadow_name is a shadow name (letters, digits, _ and -) and never `platform`, the shadow only devices write."
   }
 
   validation {
@@ -190,7 +204,7 @@ variable "firmware_download_url_template" {
     Image URL put into OTA job documents, with {product}, {version} and
     {repository} placeholders. Empty: the firmware CloudFront distribution,
     https://<distribution>/{product}/{version}/app.bin. The fallback if the
-    distribution cannot be on the CloudFront Free plan (plan §10):
+    distribution cannot be on the CloudFront Free plan:
     https://github.com/{repository}/releases/download/v{version}/app.bin
   EOT
   type        = string
@@ -254,5 +268,19 @@ variable "guard_budget_fleet_usd" {
   validation {
     condition     = var.guard_budget_fleet_usd > var.guard_budget_traffic_usd
     error_message = "Must be above guard_budget_traffic_usd: the fleet scope is the last resort."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Portal (portal.tf).
+# ---------------------------------------------------------------------------
+variable "portal_domain_prefix" {
+  description = "Cognito hosted-UI domain prefix (https://<prefix>.auth.<region>.amazoncognito.com). Empty: <project_name>-portal-<account id>."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.portal_domain_prefix == "" || can(regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", var.portal_domain_prefix))
+    error_message = "Lower-case letters, digits and hyphens, at most 63 characters."
   }
 }

@@ -11,7 +11,7 @@
 #   - a 15-minute schedule: the source of truth (a dropped event only delays);
 #   - the S3 event of each manifest.sig: the same, for that product, at once;
 #   - owner overrides: scripts/ota.sh (aws lambda invoke) or the AWS_IAM
-#     Function URL (the portal, Phase 4).
+#     Function URL (the portal, portal.tf; its viewer role may only read).
 #
 # It also owns the claim certificate (iot.tf): ACTIVE only while an
 # enrolment window is open, rotated after site windows, never in Terraform.
@@ -113,11 +113,17 @@ data "aws_iam_policy_document" "ota_controller" {
   }
 
   statement {
+    sid       = "ResetGuard"
+    actions   = ["ssm:PutParameter"]
+    resources = [aws_ssm_parameter.guard_state.arn]
+  }
+
+  statement {
     sid     = "ReadGuardAndSigningKeys"
     actions = ["ssm:GetParameter"]
     resources = [
       aws_ssm_parameter.guard_state.arn,
-      "arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter/iot-platform/products/*/signing_keys",
+      "arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter/iot-platform/products/*/signing_keys",
     ]
   }
 
@@ -126,7 +132,7 @@ data "aws_iam_policy_document" "ota_controller" {
   statement {
     sid       = "Claim"
     actions   = ["ssm:GetParameter", "ssm:PutParameter"]
-    resources = ["arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${local.claim_parameter_prefix}/*"]
+    resources = ["arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${local.claim_parameter_prefix}/*"]
   }
 
   statement {
@@ -194,6 +200,35 @@ data "aws_iam_policy_document" "ota_controller" {
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.ota.arn]
   }
+
+  # Owner actions (the portal). Quarantine: in and out of the one group.
+  statement {
+    sid       = "Quarantine"
+    actions   = ["iot:AddThingToThingGroup", "iot:RemoveThingFromThingGroup"]
+    resources = [aws_iot_thing_group.quarantine.arn, "${local.iot_arn}:thing/*"]
+  }
+
+  # Decommission: the certificates go INACTIVE and are detached (statement
+  # Certificates), then the thing is deleted.
+  statement {
+    sid       = "Decommission"
+    actions   = ["iot:DeleteThing"]
+    resources = ["${local.iot_arn}:thing/*"]
+  }
+
+  # Guard reset: deny-all off the groups the kill switch put it on, the
+  # configured rules back on.
+  statement {
+    sid       = "GuardResetPolicy"
+    actions   = ["iot:ListTargetsForPolicy", "iot:DetachPolicy"]
+    resources = concat([aws_iot_policy.guard_deny_all.arn], local.guard_fleet_group_arns)
+  }
+
+  statement {
+    sid       = "GuardResetRules"
+    actions   = ["iot:EnableTopicRule"]
+    resources = [for r in local.guard_restore_rules : "${local.iot_arn}:rule/${r}"]
+  }
 }
 
 resource "aws_iam_role_policy" "ota_controller" {
@@ -247,6 +282,10 @@ resource "aws_lambda_function" "ota_controller" {
       OTA_ROLLOUT_SUCCEEDED_THINGS     = var.ota_rollout_succeeded_things
       OTA_ROLLOUT_MAX_PER_MINUTE       = var.ota_rollout_max_per_minute
       OTA_IN_PROGRESS_TIMEOUT_MINUTES  = var.ota_in_progress_timeout_minutes
+      QUARANTINE_GROUP_ARN             = aws_iot_thing_group.quarantine.arn
+      DENY_POLICY                      = aws_iot_policy.guard_deny_all.name
+      RESTORE_RULES                    = jsonencode(local.guard_restore_rules)
+      VIEWER_ROLES                     = jsonencode([local.portal_viewer_role_name])
     }
   }
 
@@ -278,12 +317,20 @@ resource "aws_lambda_function_event_invoke_config" "ota_controller" {
   }
 }
 
-# Owner overrides for the portal (Phase 4 adds its CORS origin). AWS_IAM:
-# only principals of this account with lambda:InvokeFunctionUrl get in, and
-# a rejected request never runs the function.
+# Owner overrides for the portal. AWS_IAM: only principals of this account
+# with lambda:InvokeFunctionUrl get in (the admin role and the portal roles),
+# and a rejected request never runs the function. CORS admits the portal
+# origin alone; Lambda answers the preflight itself.
 resource "aws_lambda_function_url" "ota_controller" {
   function_name      = aws_lambda_function.ota_controller.function_name
   authorization_type = "AWS_IAM"
+
+  cors {
+    allow_origins = [local.portal_origin]
+    allow_methods = ["POST"]
+    allow_headers = ["authorization", "content-type", "x-amz-date", "x-amz-security-token", "x-amz-content-sha256"]
+    max_age       = 3600
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -357,6 +404,6 @@ resource "aws_scheduler_schedule" "ota_tick" {
 }
 
 output "ota_controller_function_url" {
-  description = "AWS_IAM Function URL for owner overrides (the portal, Phase 4). scripts/ota.sh invokes the function directly."
+  description = "AWS_IAM Function URL for owner overrides (the portal). scripts/ota.sh invokes the function directly."
   value       = aws_lambda_function_url.ota_controller.function_url
 }

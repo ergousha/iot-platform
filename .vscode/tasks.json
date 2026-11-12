@@ -9,7 +9,9 @@
         "kind": "build",
         "isDefault": true
       },
-      "problemMatcher": ["$go"]
+      "problemMatcher": [
+        "$go"
+      ]
     },
     {
       "label": "Go: Run Unit Tests",
@@ -19,7 +21,9 @@
         "kind": "test",
         "isDefault": true
       },
-      "problemMatcher": ["$go"]
+      "problemMatcher": [
+        "$go"
+      ]
     },
     {
       "label": "Go: Format Code",
@@ -55,6 +59,67 @@
       "label": "Terraform: Lint (TFLint)",
       "type": "shell",
       "command": "tflint --init && tflint -f compact",
+      "problemMatcher": []
+    },
+    {
+      "label": "Portal: Install Dependencies",
+      "type": "shell",
+      "command": "npm ci --ignore-scripts",
+      "options": {
+        "cwd": "${workspaceFolder}/portal"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Portal: Format Code",
+      "type": "shell",
+      "command": "npm run format",
+      "options": {
+        "cwd": "${workspaceFolder}/portal"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Portal: Lint & Typecheck",
+      "type": "shell",
+      "command": "npm run lint && npm run typecheck",
+      "options": {
+        "cwd": "${workspaceFolder}/portal"
+      },
+      "problemMatcher": [
+        "$tsc"
+      ]
+    },
+    {
+      "label": "Portal: Run Unit Tests",
+      "type": "shell",
+      "command": "npm test",
+      "options": {
+        "cwd": "${workspaceFolder}/portal"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Portal: Build",
+      "type": "shell",
+      "command": "npm run build",
+      "options": {
+        "cwd": "${workspaceFolder}/portal"
+      },
+      "problemMatcher": [
+        "$tsc"
+      ]
+    },
+    {
+      "label": "Security: Audit Workflows (zizmor)",
+      "type": "shell",
+      "command": "zizmor .github/ && actionlint",
+      "problemMatcher": []
+    },
+    {
+      "label": "Security: Audit Dependencies",
+      "type": "shell",
+      "command": "go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... && cd portal && npm audit && npm audit signatures",
       "problemMatcher": []
     }
   ]

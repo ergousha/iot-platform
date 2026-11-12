@@ -65,6 +65,18 @@ type Config struct {
 	TopicARN        string
 	IoTDataEndpoint string
 
+	// The guard, for the owner's guard-reset and quarantine overrides.
+	// DenyPolicy is the kill switch's deny-all policy; it stays on the
+	// quarantine group. RestoreRules are the rules a reset re-enables: the
+	// ones Terraform configures as enabled.
+	Quarantine   Group
+	DenyPolicy   string
+	RestoreRules []string
+
+	// ViewerRoles are IAM role names whose Function URL callers may only
+	// read (the portal's viewer role).
+	ViewerRoles []string
+
 	RolloutBaseRatePerMinute int32
 	RolloutIncrementFactor   float64
 	RolloutSucceededThings   int32
@@ -106,6 +118,19 @@ func (p *envParser) integer(name string, lo, hi int64) int64 {
 	return n
 }
 
+// stringList reads a JSON list of strings; it must be set, and may be [].
+func (p *envParser) stringList(name string) []string {
+	v := p.required(name)
+	if v == "" {
+		return nil
+	}
+	var list []string
+	if err := json.Unmarshal([]byte(v), &list); err != nil {
+		p.errs = append(p.errs, fmt.Errorf("%s=%q: must be a JSON list of strings", name, v))
+	}
+	return list
+}
+
 func groupFromARN(value string) (Group, bool) {
 	a, err := arn.Parse(value)
 	name, found := strings.CutPrefix(a.Resource, "thinggroup/")
@@ -133,6 +158,15 @@ func loadConfig(getenv func(string) string) (Config, error) {
 		TopicARN:             p.required("NOTIFY_TOPIC_ARN"),
 		IoTDataEndpoint:      p.required("IOT_DATA_ENDPOINT"),
 	}
+	if q := p.required("QUARANTINE_GROUP_ARN"); q != "" {
+		var ok bool
+		if c.Quarantine, ok = groupFromARN(q); !ok {
+			p.errs = append(p.errs, fmt.Errorf("QUARANTINE_GROUP_ARN=%q: not a thing group ARN", q))
+		}
+	}
+	c.DenyPolicy = p.required("DENY_POLICY")
+	c.RestoreRules = p.stringList("RESTORE_RULES")
+	c.ViewerRoles = p.stringList("VIEWER_ROLES")
 	if c.DownloadURLTemplate != "" && (!strings.HasPrefix(c.DownloadURLTemplate, "https://") || !strings.Contains(c.DownloadURLTemplate, "{version}")) {
 		p.errs = append(p.errs, fmt.Errorf("DOWNLOAD_URL_TEMPLATE=%q: must be an https URL with a {version} placeholder", c.DownloadURLTemplate))
 	}

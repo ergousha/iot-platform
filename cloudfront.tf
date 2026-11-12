@@ -14,7 +14,7 @@
 # plan). The plan never bills overage and includes WAF with a rate rule; the
 # AWS provider cannot set it yet. Without it, pay-as-you-go applies past
 # the always-free 1 TB and 10M requests a month: a download-flood risk. If
-# the account is not eligible (plan §10), set firmware_download_url_template
+# the account is not eligible, set firmware_download_url_template
 # to the GitHub Releases fallback and disable this distribution.
 # ===========================================================================
 

@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   go:
     name: Go Lint & Test
@@ -85,3 +89,47 @@ jobs:
 
       - name: Run TFLint
         run: tflint -f compact
+
+  portal:
+    name: Portal Lint, Typecheck, Test & Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: portal
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # No secrets in this job, so the npm cache is safe.
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: portal/package-lock.json
+
+      - name: Install (lockfile only, no install scripts)
+        run: npm ci --ignore-scripts
+
+      # Biome: formatting and lint (warnings fail too).
+      - name: Format & lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      # The portal CSP is script-src 'self'; style-src 'self' (portal.tf).
+      - name: No inline script or style in the build
+        run: |
+          if grep -nE '<script>|<script [^>]*>[^<]|<style|style=' dist/index.html; then
+            echo "dist/index.html has inline script or style, which the portal CSP blocks"
+            exit 1
+          fi

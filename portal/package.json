@@ -1,0 +1,38 @@
+{
+  "name": "iot-platform-portal",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "lint": "biome ci --error-on-warnings .",
+    "format": "biome check --write ."
+  },
+  "dependencies": {
+    "@aws-crypto/sha256-js": "5.2.0",
+    "@aws-sdk/client-cloudtrail": "3.1161.0",
+    "@aws-sdk/client-cloudwatch": "3.1161.0",
+    "@aws-sdk/client-dynamodb": "3.1161.0",
+    "@aws-sdk/client-iot": "3.1161.0",
+    "@aws-sdk/client-iot-data-plane": "3.1161.0",
+    "@aws-sdk/client-ssm": "3.1161.0",
+    "@aws-sdk/credential-provider-cognito-identity": "3.972.79",
+    "@smithy/protocol-http": "5.6.2",
+    "@smithy/signature-v4": "5.7.5",
+    "oidc-client-ts": "3.5.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.5",
+    "vitest": "5.0.5"
+  }
+}

@@ -149,7 +149,7 @@ To **re-enrol** a device (a new key, erased NVS), use `ergo commission --reprovi
 
 ## 3. Firmware Release & OTA Flow
 
-Releases are fully automated (platform plan §5b). A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub pre-release and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
+Releases are fully automated. A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub pre-release and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
 
 ### What a release uploads
 
@@ -178,7 +178,7 @@ It runs every 15 minutes (the source of truth), on the S3 event of each `manifes
 | Done | One "fleet on X.Y.Z" email. |
 | Legacy | Jobs of the old `ota_trigger` (`ota-<p>-firmware_v…-<ms>`) are cancelled: their presigned URLs died with it. |
 
-Job documents always carry the v1 fields (`operation`, `product`, `firmware_version`, `download_url`) and `contract: 1`. They also carry `manifest`, `sig` and `key_id` once **every** target device reports that key id in its `platform` shadow: a device whose firmware has no keys yet would refuse a signed job, so it gets the v1 document while the controller has already checked the signature. Phase 6 (`signed-only`) ends that transition. Executions time out after `ota_in_progress_timeout_minutes` (60) with two retries; a FAILED execution is final.
+Job documents always carry the v1 fields (`operation`, `product`, `firmware_version`, `download_url`) and `contract: 1`. They also carry `manifest`, `sig` and `key_id` once **every** target device reports that key id in its `platform` shadow: a device whose firmware has no keys yet would refuse a signed job, so it gets the v1 document while the controller has already checked the signature. A `signed-only` mode ends that transition. Executions time out after `ota_in_progress_timeout_minutes` (60) with two retries; a FAILED execution is final.
 
 State lives in the attributes of the product's fleet group: `ota_mode` (`auto`, `hold`, `frozen`), `soak_hours`, `fleet_version`, `halted_version`, `halted_reason`, and `notified` (the one-off emails already sent). Terraform ignores them. Emails go to SNS `esp32-ztp-ota` (confirm its subscription mail once).
 
@@ -194,7 +194,13 @@ scripts/ota.sh target   vaktus <thing>      # back from excluded, with its own j
 scripts/ota.sh rotate-claim
 ```
 
-Only `rollback` downgrades, and only to a verified version; the tick never does. The same actions go through the controller's `AWS_IAM` Function URL (`terraform output ota_controller_function_url`) for the portal (Phase 4). Overrides that create jobs are refused while the guard is tripped.
+```sh
+scripts/ota.sh quarantine|unquarantine vaktus <thing>   # in or out of the deny-all group
+scripts/ota.sh decommission vaktus <thing>              # certificates INACTIVE, thing deleted (asks first)
+scripts/ota.sh guard-reset                              # guard-reset.sh, plus the configured rules back on
+```
+
+Only `rollback` downgrades, and only to a verified version; the tick never does. The same actions go through the controller's `AWS_IAM` Function URL (`terraform output ota_controller_function_url`), which the [portal](#6-portal) uses; a caller on the portal's viewer role gets `status` only. Overrides that create jobs are refused while the guard is tripped. Every email of an action requested through the URL names the caller's role session and access key.
 
 ### Thing groups
 
@@ -274,6 +280,16 @@ To simplify developer workflows, this repository is configured with VS Code Task
 *   **Terraform: Format Files**: Rewrites Terraform files into canonical format (`terraform fmt`).
 *   **Terraform: Validate**: Initializes modules and validates Terraform structure (`terraform init -backend=false && terraform validate`).
 *   **Terraform: Lint (TFLint)**: Audits Terraform configurations using `tflint`.
+*   **Portal: Install Dependencies**: `npm ci --ignore-scripts` (the lockfile only; no dependency runs code at install time).
+*   **Portal: Format Code**: Formats and organises imports with Biome (`npm run format`).
+*   **Portal: Lint & Typecheck**: Biome lint and format check (warnings fail) and `tsc`.
+*   **Portal: Run Unit Tests** / **Portal: Build**: Vitest; the production build into `portal/dist`.
+*   **Security: Audit Workflows (zizmor)**: `zizmor` and `actionlint` over `.github/`.
+*   **Security: Audit Dependencies**: `govulncheck` for the Lambdas; `npm audit` and `npm audit signatures` for the portal.
+
+Local tools beyond Go, Terraform and Node: `tflint` at the CI version (`go install github.com/terraform-linters/tflint@v0.64.0`; Homebrew no longer ships it), `golangci-lint`, and `brew install zizmor actionlint`.
+
+CI runs the same checks: [`ci.yml`](.github/workflows/ci.yml) (Go, Terraform with TFLint, the portal), [`zizmor.yml`](.github/workflows/zizmor.yml) on workflow changes, and [`security-audit.yml`](.github/workflows/security-audit.yml) on dependency changes and weekly. Dependabot ([`dependabot.yml`](.github/dependabot.yml)) proposes Go, npm, Terraform provider and action updates only once a release is 14 days old.
 
 ### SSM Parameter Store Integration
 
@@ -345,7 +361,76 @@ Budget notifications lag the spend by hours, so the alarms are the first line an
 
 ---
 
-## 6. Project Costs & Teardown
+## 6. Portal
+
+A web console for the platform: see every device, release and alarm, and make the owner's changes (rollout groups, OTA overrides, quarantine, guard reset) without the CLI. It is a static SPA ([portal/](portal), Vite + React + TypeScript) on its own CloudFront origin ([portal.tf](portal.tf)). It is not on `ergousha.github.io`: every Pages site of the account shares that origin and could read the portal's tokens.
+
+Each screen opens with a sentence on what it is for, and the ⓘ marks and status labels explain themselves on hover. Two roles see it: an **owner** gets the buttons, a **viewer** the same screens read-only. Nothing refreshes on its own; **↻ Refresh** reloads everything from AWS.
+
+### Devices
+
+![Devices: two devices with their online lights, firmware versions, last-seen times, restart reasons and rollout groups](docs/images/portal-devices.jpg)
+
+Every device the OTA controller tracks, across products. The headline cards count devices that are online, offline and quarantined. Each row has a green or red light (online is derived from the connect and disconnect events, see [Presence](#presence)), the reported firmware, when the device last connected or disconnected (hover for the exact times), why it last restarted (`sw` is a software restart, for example after an OTA update; crashes and watchdog resets show in red) and its rollout group. Selecting a row opens the device: its product shadow, its OTA job executions, its registry record and what it reports to the controller. An owner can set desired state on the product shadow (`vaktus`, `opcua`) from there.
+
+### Groups
+
+![Groups: a legend of canary, fleet, excluded and quarantined, and per device a group switch, a quarantine button, Target and Decommission](docs/images/portal-groups.jpg)
+
+Where each device sits in its product's rollout ([Thing groups](#thing-groups)), and the per-device safety switches. The legend explains the four states. Per device, the owner:
+
+- switches between **Canary**, **Fleet** and **Excluded** (straight to AWS IoT, within the device's own product groups);
+- **Quarantines** it: AWS IoT refuses the device's next connect or publish until it is released;
+- **Targets** it: a job of its own for the fleet version, which also brings an excluded device back;
+- **Decommissions** it: its certificates go inactive and the thing is deleted, after typing the thing name to confirm.
+
+Everything except the group switch goes through the OTA controller, which emails the change with the requesting session.
+
+### Releases
+
+![Releases: the product picker, mode, fleet version, soak time and halt cards, the releases table, and the overrides](docs/images/portal-releases.jpg)
+
+How firmware reaches one product's devices; the picker at the top chooses the product. The cards show the [OTA mode](#owner-overrides), the fleet version, the soak time and whether a release is halted. The releases table places every verified release against the fleet (**On the fleet**, **Newer**, **Older**, **Halted**, or **Refused** with the controller's reason) with the key that signed it, and lists the product's active OTA jobs. The owner's [overrides](#owner-overrides):
+
+- **Mode**: Automatic (canary, soak, promote), Hold (canary and soak, then an email instead of promoting) or Freeze (the controller leaves the product alone);
+- **Promote to fleet** (skips the soak) and **Rerun canary**, for the newest or a chosen verified release;
+- **Roll back** to a verified version below the fleet's (the current one is halted and the product goes on hold).
+
+**Job history** loads the product's OTA jobs on demand.
+
+### Other screens
+
+| Screen | Shows | Owner can |
+| :--- | :--- | :--- |
+| Enrolment | how a device joins: open enrolment windows, the claim certificate (active only while a window is open, when it was last rotated) and the registry with each record's state in plain words. Read-only: windows are opened with `ergo commission` | |
+| Guard | what the [guard](#5-guard-rails-cost-protection) is, whether it is clear or tripped (and why), the three stages a trip goes through, every guard alarm with its state, and the quarantined devices | reset the guard |
+| Audit (owner only) | portal sign-ins (CloudTrail, by the `username` session tag) and the AWS calls each session made | |
+
+### Sign-in, security and deployment
+
+**Sign-in.** Cognito managed login (Essentials tier: free up to 10,000 monthly active users), styled like the portal in light and dark mode (colours and logos in [portal.tf](portal.tf), logo source in `portal/branding/`, rendered by `scripts/portal-branding.sh`), admin-created users only, TOTP required, no SMS. Code flow with PKCE; tokens in memory only, so a reload signs in again through managed login's session cookie. An identity pool maps the user's group to an IAM role: `owner` or `viewer`; a user in neither gets no credentials. No browser role can touch certificates, the claim, templates, the registry or jobs; everything beyond shadow desired state and canary/excluded membership goes through the controller's Function URL, whose CORS admits only the portal origin. `lambda:InvokeFunction` is granted only with `lambda:InvokedViaFunctionUrl`, so a viewer cannot bypass the URL's role check with a direct invoke.
+
+**Headers** (a viewer-response CloudFront Function; the Free plan allows no custom response headers policy): `default-src 'none'; script-src 'self'; style-src 'self'; connect-src` the AWS endpoints only; `frame-ancestors 'none'`, `X-Frame-Options: DENY`, HSTS, `no-referrer`, a Permissions-Policy that denies camera, microphone, USB, serial and the rest. Device-written fields are rendered as clipped React text only. Nothing polls: data loads at sign-in and on **Refresh**.
+
+**Deploy.**
+
+```sh
+terraform apply                                 # Cognito, roles, bucket, distribution, config.json
+scripts/portal-deploy.sh                        # npm ci --ignore-scripts, test, build, upload
+scripts/portal-user.sh add <name> <email> owner # Cognito emails a temporary password
+terraform output portal_url
+```
+
+Then put the portal distribution on the CloudFront **Free flat-rate plan** in the console, as for the firmware distribution. `scripts/portal-user.sh role <name> viewer|owner|none` changes a role and ends the user's sessions; `remove` deletes a user.
+
+**Checks after the first deploy**:
+
+1. Every override works from the portal: hold, resume, freeze, promote, rerun, rollback, target, quarantine, decommission, guard reset.
+2. Framing is blocked: an `<iframe src="<portal_url>">` on any other page stays blank (`frame-ancestors 'none'`, `X-Frame-Options: DENY`).
+3. The viewer role cannot write: as a viewer, the controller answers 403 to anything but `status`, and `aws lambda invoke` with the viewer's credentials is denied.
+4. Shadow reads and desired-state writes work with the identity pool's credentials. AWS documents HTTPS SigV4 calls as IAM-only (an IoT policy on the Cognito identity is for MQTT); if that is wrong, these two calls move behind the Function URL.
+
+## 7. Project Costs & Teardown
 
 ### Cost Breakdown
 All resources deployed in this repository are serverless and billed purely on-demand, costing **~$0.00 USD/month when idle**:
@@ -360,6 +445,7 @@ All resources deployed in this repository are serverless and billed purely on-de
 | **CloudFront** (firmware) | Free flat-rate plan | $0, no overage (attach the plan in the console after the first apply; see [cloudfront.tf](cloudfront.tf)) |
 | **EventBridge Scheduler** | 2,976 ticks a month | $0 (14M free invocations) |
 | **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: 8 of the 10 free alarm metrics, a handful of messages, budgets without actions |
+| **Portal**: Cognito Essentials, identity pool, CloudFront (Free plan), S3 | per MAU (Essentials: free up to 10,000) | $0 |
 
 Telemetry is not routed to CloudWatch Logs by default (`debug_telemetry_logs = false`): every message would be billed as a rule, an action and Logs ingestion. Turn it on for a debugging session or a gateway HIL run (`terraform apply -var debug_telemetry_logs=true`), and off again afterwards.
 
@@ -368,3 +454,5 @@ To destroy all Terraform-managed resources:
 ```sh
 terraform destroy
 ```
+
+The portal's user pool has deletion protection: set `deletion_protection = "INACTIVE"` in [portal.tf](portal.tf) and apply first. Empty the portal bucket (`aws s3 rm s3://<portal bucket> --recursive`) as well.

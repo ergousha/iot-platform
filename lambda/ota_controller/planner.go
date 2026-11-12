@@ -198,7 +198,7 @@ func (pl *planner) release(v Version) *Release {
 // signing key (its platform shadow lists the key id). Units running firmware
 // without that key would refuse a signed job (reason sig), so they get the
 // v1 document until every unit has the key; the controller has verified the
-// signature either way. Phase 6 (`signed-only`) ends the transition.
+// signature either way. A `signed-only` mode ends the transition.
 func (pl *planner) signedFor(r *Release, things []string) bool {
 	if len(things) == 0 {
 		return false

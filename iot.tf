@@ -19,7 +19,7 @@ locals {
 #    commission` and its enrolment (it is erased from the board afterwards).
 #    It can reach the provisioning topics and nothing else.
 #
-#    Not in Terraform (platform plan, Phase 3): the OTA controller creates it
+#    Not in Terraform: the OTA controller creates it
 #    from a CSR whose key never leaves the Lambda's memory and SSM
 #    (/iot-platform/claim/{cert,key}), keeps it INACTIVE outside enrolment
 #    windows, rotates it after site windows and on demand
@@ -54,7 +54,7 @@ resource "aws_iot_policy" "claim" {
         Sid      = "Connect"
         Effect   = "Allow"
         Action   = "iot:Connect"
-        Resource = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:client/claim-*"
+        Resource = "arn:aws:iot:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:client/claim-*"
       },
       {
         Sid      = "CreateKeysAndCertificate"
@@ -83,7 +83,7 @@ locals {
   # this policy originally did) overflowed the limit as soon as the OPC UA
   # shadow topics were added, so the document is deliberately written as one
   # statement per ACTION with a resource list, rather than one per topic group.
-  iot_arn = "arn:aws:iot:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}"
+  iot_arn = "arn:aws:iot:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}"
 
   # Policy variable, resolved by AWS per connection. `$$` escapes the Terraform
   # interpolation so the literal `${iot:...}` reaches the policy document.

@@ -1,0 +1,38 @@
+name: Zizmor Security Checks
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/**'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - '.github/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zizmor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: Zizmor Security Linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # pipx ships with the runner image; the version is pinned.
+      - name: Install zizmor
+        run: pipx install zizmor==1.31.1
+
+      # The token (read-only) enables the online audits: impostor commits,
+      # known-vulnerable actions, ref confusion.
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: zizmor .github/
