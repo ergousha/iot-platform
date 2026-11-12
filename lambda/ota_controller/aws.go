@@ -615,10 +615,12 @@ func (a *App) keyring(ctx context.Context, product string) (Keyring, error) {
 	return ParseKeyring(aws.ToString(out.Parameter.Value))
 }
 
-// orphans are GitHub pre-releases above the fleet version, older than an
-// hour, whose manifest never reached S3 (a publish that failed after the
-// tag). Best effort: the unauthenticated API is rate limited, and errors are
-// only logged.
+// orphans are GitHub pre-releases of the release workflow (they carry a
+// manifest.sig asset, uploaded before S3) above the fleet version, older than
+// an hour, whose manifest never reached S3 (a publish that failed after the
+// tag). Pre-releases from before the workflow carry no manifest.sig and are
+// not reported. Best effort: the unauthenticated API is rate limited, and
+// errors are only logged.
 func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []string {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
 		"https://api.github.com/repos/"+p.Repository+"/releases?per_page=20", nil)
@@ -639,6 +641,9 @@ func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []strin
 		Draft      bool      `json:"draft"`
 		Prerelease bool      `json:"prerelease"`
 		CreatedAt  time.Time `json:"created_at"`
+		Assets     []struct {
+			Name string `json:"name"`
+		} `json:"assets"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rels); err != nil {
 		slog.Warn("GitHub releases unreadable", "product", p.ID, "error", err)
@@ -656,6 +661,13 @@ func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []strin
 		v, err := ParseVersion(r.Tag)
 		if err != nil || r.Draft || !r.Prerelease || s.Now.Sub(r.CreatedAt) < time.Hour ||
 			!s.State.FleetVersion.Less(v) || known[v.String()] {
+			continue
+		}
+		signed := false
+		for _, as := range r.Assets {
+			signed = signed || as.Name == "manifest.sig"
+		}
+		if !signed {
 			continue
 		}
 		out = append(out, v.String())
