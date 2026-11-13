@@ -40,6 +40,17 @@ resource "aws_dynamodb_table" "presence" {
   }
 }
 
+# The trust policy of IoT rule roles.
+data "aws_iam_policy_document" "iot_rule_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["iot.amazonaws.com"]
+    }
+  }
+}
+
 resource "aws_iam_role" "presence_rule" {
   name               = "${var.project_name}-presence-rule-role"
   assume_role_policy = data.aws_iam_policy_document.iot_rule_assume.json

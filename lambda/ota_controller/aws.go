@@ -273,6 +273,9 @@ func (a *App) loadGlobal(ctx context.Context) (*global, error) {
 type GuardState struct {
 	Tripped bool   `json:"tripped"`
 	Scope   string `json:"scope,omitempty"`
+	// DisabledRules are the product rules (<product>_*) the trip disabled
+	// while they were enabled.
+	DisabledRules []string `json:"disabled_rules,omitempty"`
 }
 
 // guard reads the guard state. Unreadable counts as tripped: never arm or

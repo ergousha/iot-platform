@@ -21,6 +21,8 @@ type mockIoT struct {
 	certs    []string // "id=status"
 	rules    []string
 	attached []string // "policy@target"
+	// topicRules is what ListTopicRules returns, two per page.
+	topicRules []iottypes.TopicRuleListItem
 
 	attachErr  func(target string) error
 	disableErr error
@@ -51,6 +53,23 @@ func (m *mockIoT) UpdateCertificate(ctx context.Context, p *iot.UpdateCertificat
 func (m *mockIoT) DisableTopicRule(ctx context.Context, p *iot.DisableTopicRuleInput, _ ...func(*iot.Options)) (*iot.DisableTopicRuleOutput, error) {
 	m.rules = append(m.rules, aws.ToString(p.RuleName))
 	return &iot.DisableTopicRuleOutput{}, m.disableErr
+}
+
+func (m *mockIoT) ListTopicRules(ctx context.Context, p *iot.ListTopicRulesInput, _ ...func(*iot.Options)) (*iot.ListTopicRulesOutput, error) {
+	start := 0
+	if p.NextToken != nil {
+		start = len(aws.ToString(p.NextToken))
+	}
+	end := min(start+2, len(m.topicRules))
+	out := &iot.ListTopicRulesOutput{Rules: m.topicRules[start:end]}
+	if end < len(m.topicRules) {
+		out.NextToken = aws.String(strings.Repeat("x", end))
+	}
+	return out, nil
+}
+
+func topicRule(name string, disabled bool) iottypes.TopicRuleListItem {
+	return iottypes.TopicRuleListItem{RuleName: aws.String(name), RuleDisabled: aws.Bool(disabled)}
 }
 
 func (m *mockIoT) AttachPolicy(ctx context.Context, p *iot.AttachPolicyInput, _ ...func(*iot.Options)) (*iot.AttachPolicyOutput, error) {
@@ -108,7 +127,8 @@ func testEnv() map[string]string {
 			`"esp32-ztp-guard-connect-5m":"provisioning","esp32-ztp-guard-hook-5m":"provisioning","esp32-ztp-guard-ota-errors":"notify"}`,
 		"BUDGET_SCOPES":         `{"esp32-ztp-guard-traffic":"traffic","esp32-ztp-guard-fleet":"fleet"}`,
 		"CLAIM_POLICY":          claimPolicy,
-		"KILLABLE_RULES":        `["esp32_ztp_telemetry_to_logs","esp32_ztp_opcua_telemetry_to_logs"]`,
+		"KILLABLE_RULES":        `["esp32_ztp_presence"]`,
+		"PRODUCT_RULE_PREFIXES": `["gateway_","vaktus_"]`,
 		"DENY_POLICY":           denyPolicy,
 		"FLEET_GROUP_ARNS":      `["` + groupA + `","` + groupB + `"]`,
 		"GUARD_STATE_PARAMETER": "/esp32-ztp/guard/state",
@@ -122,7 +142,15 @@ func newApp(t *testing.T, s *mockSSM) (*App, *mockIoT) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := &mockIoT{}
+	// A product's debug rule (off), a product's live rule, a rule that is
+	// no product's, and a rule whose name only starts like a product id.
+	m := &mockIoT{topicRules: []iottypes.TopicRuleListItem{
+		topicRule("gateway_opcua_telemetry_to_logs", true),
+		topicRule("vaktus_readings", false),
+		topicRule("someone_else", false),
+		topicRule("gatewayx_readings", false),
+		topicRule("esp32_ztp_presence", false),
+	}}
 	if s == nil {
 		s = &mockSSM{}
 	}
@@ -157,7 +185,7 @@ Alert Threshold: > $25.00`
 
 func TestScopes(t *testing.T) {
 	claimOff := []string{claimID + "=INACTIVE"}
-	rules := []string{"esp32_ztp_telemetry_to_logs", "esp32_ztp_opcua_telemetry_to_logs"}
+	rules := []string{"esp32_ztp_presence", "vaktus_readings"}
 	denied := []string{denyPolicy + "@" + groupA, denyPolicy + "@" + groupB}
 
 	tests := []struct {
@@ -202,6 +230,9 @@ func TestScopes(t *testing.T) {
 			}
 			if !st.Tripped || st.Scope != tt.wantScope || st.Since != "2026-11-10T20:00:00Z" || len(st.Reasons) != 1 {
 				t.Errorf("unexpected state %+v", st)
+			}
+			if wantDisabled := tt.wantRules != nil; wantDisabled != reflect.DeepEqual(st.DisabledRules, []string{"vaktus_readings"}) {
+				t.Errorf("disabled_rules = %v", st.DisabledRules)
 			}
 		})
 	}
@@ -297,6 +328,7 @@ func TestLoadConfig(t *testing.T) {
 		"ALARM_SCOPES":          `{"a":"everything"}`,
 		"BUDGET_SCOPES":         `not json`,
 		"KILLABLE_RULES":        `[""]`,
+		"PRODUCT_RULE_PREFIXES": `["gateway"]`,
 		"FLEET_GROUP_ARNS":      `[]`,
 		"CLAIM_POLICY":          "",
 		"DENY_POLICY":           "",
@@ -330,6 +362,7 @@ func TestConcurrentTripIsMerged(t *testing.T) {
 		}
 	}}
 	app, m := newApp(t, s)
+	m.topicRules = nil // no product rule to record: only the trip's own writes
 	if err := app.Handler(context.Background(), snsEvent(alarm("esp32-ztp-guard-publish-30m", "ALARM"))); err != nil {
 		t.Fatal(err)
 	}
@@ -343,5 +376,50 @@ func TestConcurrentTripIsMerged(t *testing.T) {
 	}
 	if len(m.attached) != 2 {
 		t.Errorf("fleet must be enforced, got %v", m.attached)
+	}
+}
+
+// A repeated notification finds the product rule already off: it is not
+// disabled again, and the recorded list keeps it (a reset enables it).
+func TestRepeatedTripKeepsDisabledRules(t *testing.T) {
+	s := &mockSSM{}
+	app, m := newApp(t, s)
+	if err := app.Handler(context.Background(), snsEvent(alarm("esp32-ztp-guard-publish-5m", "ALARM"))); err != nil {
+		t.Fatal(err)
+	}
+	m.topicRules[1] = topicRule("vaktus_readings", true)
+	m.rules = nil
+	if err := app.Handler(context.Background(), snsEvent(alarm("esp32-ztp-guard-publish-30m", "ALARM"))); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(m.rules, []string{"esp32_ztp_presence"}) {
+		t.Errorf("only the platform rule is re-asserted, got %v", m.rules)
+	}
+	var st GuardState
+	_ = json.Unmarshal([]byte(*s.value), &st)
+	if st.Scope != "fleet" || !reflect.DeepEqual(st.DisabledRules, []string{"vaktus_readings"}) {
+		t.Errorf("unexpected state %+v", st)
+	}
+}
+
+// A concurrent trip that overwrites the record after the rules were recorded
+// is merged back on the read-back.
+func TestDisabledRulesSurviveARace(t *testing.T) {
+	puts := 0
+	s := &mockSSM{}
+	s.afterPut = func(m *mockSSM) {
+		puts++
+		if puts == 2 { // the disabled_rules write
+			m.value = aws.String(`{"tripped":true,"scope":"traffic","since":"2026-11-10T20:00:00Z","reasons":["other"]}`)
+		}
+	}
+	app, _ := newApp(t, s)
+	if err := app.Handler(context.Background(), snsEvent(alarm("esp32-ztp-guard-publish-5m", "ALARM"))); err != nil {
+		t.Fatal(err)
+	}
+	var st GuardState
+	_ = json.Unmarshal([]byte(*s.value), &st)
+	if !reflect.DeepEqual(st.DisabledRules, []string{"vaktus_readings"}) || !containsString(st.Reasons, "other") {
+		t.Errorf("unexpected state %+v", st)
 	}
 }

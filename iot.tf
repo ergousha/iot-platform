@@ -317,80 +317,20 @@ moved {
 }
 
 # ---------------------------------------------------------------------------
-# 5) (Optional) Simple IoT Rule to route telemetry to CloudWatch Logs.
-#    Useful to see that the device actually publishes. OFF by default: every
-#    message would be billed as a rule, an action and Logs ingestion. Turn it on
-#    for a debugging session or a HIL run with -var debug_telemetry_logs=true.
+# 5) Telemetry rules belong to the products (plan §7): a product's cloud/
+#    root (state products/<id>/cloud.tfstate) owns its rules, named <id>_*,
+#    which the kill switch disables by name. The platform keeps none.
+#
+#    The gateway's OPC UA debug rule moved to its cloud/. Its log group,
+#    /esp32-ztp/opcua-telemetry, which gateway-hil reads, is kept and
+#    imported there; the rule itself is recreated as
+#    gateway_opcua_telemetry_to_logs, so its old one is destroyed here. The
+#    dt/+/data rule had no producer and is gone, with its log group and role.
 # ---------------------------------------------------------------------------
-resource "aws_cloudwatch_log_group" "telemetry" {
-  name              = "/${var.project_name}/telemetry"
-  retention_in_days = var.log_retention_days
-}
+removed {
+  from = aws_cloudwatch_log_group.opcua_telemetry
 
-data "aws_iam_policy_document" "iot_rule_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["iot.amazonaws.com"]
-    }
-  }
-}
-
-resource "aws_iam_role" "iot_rule" {
-  name               = "${var.project_name}-telemetry-rule-role"
-  assume_role_policy = data.aws_iam_policy_document.iot_rule_assume.json
-}
-
-resource "aws_iam_role_policy" "iot_rule" {
-  name = "${var.project_name}-telemetry-rule-policy"
-  role = aws_iam_role.iot_rule.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = ["logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogStreams"]
-      Resource = [
-        "${aws_cloudwatch_log_group.telemetry.arn}:*",
-        "${aws_cloudwatch_log_group.opcua_telemetry.arn}:*",
-      ]
-    }]
-  })
-}
-
-resource "aws_iot_topic_rule" "telemetry_to_logs" {
-  name        = replace("${var.project_name}_telemetry_to_logs", "-", "_")
-  enabled     = var.debug_telemetry_logs
-  sql         = "SELECT *, topic() AS topic, timestamp() AS ts FROM '${var.telemetry_topic_prefix}/+/data'"
-  sql_version = "2016-03-23"
-
-  cloudwatch_logs {
-    log_group_name = aws_cloudwatch_log_group.telemetry.name
-    role_arn       = aws_iam_role.iot_rule.arn
-  }
-}
-
-# ---------------------------------------------------------------------------
-# 6) OPC UA gateway telemetry.
-#    The OPC UA driver publishes BATCHES on `<prefix>/<thing>/opcua`, which the
-#    `<prefix>/+/data` rule above does not match. A separate log group keeps the
-#    batched OPC UA payloads out of the plain-telemetry stream, which is what
-#    makes the firmware repo's on-device test (`gateway-hil`) observable from
-#    the cloud side.
-# ---------------------------------------------------------------------------
-resource "aws_cloudwatch_log_group" "opcua_telemetry" {
-  name              = "/${var.project_name}/opcua-telemetry"
-  retention_in_days = var.log_retention_days
-}
-
-resource "aws_iot_topic_rule" "opcua_telemetry_to_logs" {
-  name        = replace("${var.project_name}_opcua_telemetry_to_logs", "-", "_")
-  enabled     = var.debug_telemetry_logs
-  sql         = "SELECT *, topic() AS topic, timestamp() AS ts FROM '${var.telemetry_topic_prefix}/+/opcua'"
-  sql_version = "2016-03-23"
-
-  cloudwatch_logs {
-    log_group_name = aws_cloudwatch_log_group.opcua_telemetry.name
-    role_arn       = aws_iam_role.iot_rule.arn
+  lifecycle {
+    destroy = false
   }
 }

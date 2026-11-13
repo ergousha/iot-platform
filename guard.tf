@@ -6,7 +6,7 @@
 # to one SNS topic. The topic emails the owner and invokes the kill switch,
 # which acts by scope:
 #   provisioning  claim certificate INACTIVE
-#   traffic       + killable IoT rules disabled
+#   traffic       + killable IoT rules disabled (presence, products' <id>_*)
 #   fleet         + deny-all policy on every fleet group (devices go offline)
 # scripts/guard-reset.sh undoes a trip. Cost: $0 (8 of the 10 free alarm
 # metrics, budgets without actions, Lambda and SNS inside the free tier).
@@ -38,21 +38,24 @@ locals {
     "${local.guard_prefix}-fleet"   = "fleet"
   }
 
-  # Rules the traffic scope disables. Their per-message cost (rule, action,
-  # Logs ingestion) is what an attacker with a device certificate could drive.
+  # Platform rules the traffic scope disables. Their per-message cost (rule,
+  # action) is what an attacker with a device certificate could drive.
   guard_killable_rules = [
-    aws_iot_topic_rule.telemetry_to_logs.name,
-    aws_iot_topic_rule.opcua_telemetry_to_logs.name,
     aws_iot_topic_rule.presence.name,
   ]
 
   # The killable rules Terraform keeps enabled: what a guard reset through
   # the OTA controller (the portal) re-enables. guard-reset.sh leaves this
   # to the next apply.
-  guard_restore_rules = concat(
-    [aws_iot_topic_rule.presence.name],
-    var.debug_telemetry_logs ? [aws_iot_topic_rule.telemetry_to_logs.name, aws_iot_topic_rule.opcua_telemetry_to_logs.name] : [],
-  )
+  guard_restore_rules = [aws_iot_topic_rule.presence.name]
+
+  # Product rules (plan §7) live in each product's cloud/ root, outside this
+  # state, and are named <id>_* (also the Basic Ingest topics
+  # $aws/rules/<id>_* the device policy allows). The traffic scope disables
+  # every enabled one by that name and records it in the guard state; a reset
+  # enables those again.
+  guard_product_rule_prefixes = [for id in keys(local.products) : "${id}_"]
+  guard_product_rule_arns     = [for prefix in local.guard_product_rule_prefixes : "${local.iot_arn}:rule/${prefix}*"]
 
   # Every group whose devices the fleet scope cuts off. Canary groups inherit
   # from their fleet group; excluded groups are outside that hierarchy.
@@ -249,7 +252,13 @@ resource "aws_iam_role_policy" "kill_switch" {
       {
         Effect   = "Allow"
         Action   = "iot:DisableTopicRule"
-        Resource = [for r in local.guard_killable_rules : "${local.iot_arn}:rule/${r}"]
+        Resource = concat([for r in local.guard_killable_rules : "${local.iot_arn}:rule/${r}"], local.guard_product_rule_arns)
+      },
+      {
+        # Finds the product rules (<id>_*); ListTopicRules has no resource.
+        Effect   = "Allow"
+        Action   = "iot:ListTopicRules"
+        Resource = "*"
       },
       {
         # AttachPolicy is authorised against the target; only the fleet and
@@ -285,6 +294,7 @@ resource "aws_lambda_function" "kill_switch" {
       BUDGET_SCOPES         = jsonencode(local.guard_budget_scopes)
       CLAIM_POLICY          = aws_iot_policy.claim.name
       KILLABLE_RULES        = jsonencode(local.guard_killable_rules)
+      PRODUCT_RULE_PREFIXES = jsonencode(local.guard_product_rule_prefixes)
       DENY_POLICY           = aws_iot_policy.guard_deny_all.name
       FLEET_GROUP_ARNS      = jsonencode(local.guard_fleet_group_arns)
       GUARD_STATE_PARAMETER = aws_ssm_parameter.guard_state.name

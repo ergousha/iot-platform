@@ -217,7 +217,7 @@ data "aws_iam_policy_document" "ota_controller" {
   }
 
   # Guard reset: deny-all off the groups the kill switch put it on, the
-  # configured rules back on.
+  # configured rules and the product rules the trip disabled back on.
   statement {
     sid       = "GuardResetPolicy"
     actions   = ["iot:ListTargetsForPolicy", "iot:DetachPolicy"]
@@ -227,7 +227,7 @@ data "aws_iam_policy_document" "ota_controller" {
   statement {
     sid       = "GuardResetRules"
     actions   = ["iot:EnableTopicRule"]
-    resources = [for r in local.guard_restore_rules : "${local.iot_arn}:rule/${r}"]
+    resources = concat([for r in local.guard_restore_rules : "${local.iot_arn}:rule/${r}"], local.guard_product_rule_arns)
   }
 }
 

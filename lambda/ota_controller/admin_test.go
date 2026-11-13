@@ -220,7 +220,10 @@ func TestDecommission(t *testing.T) {
 func TestGuardReset(t *testing.T) {
 	a, f, ssmf, snsf := adminApp()
 	fleet := vaktus.Fleet.ARN
-	tripped := `{"tripped":true,"scope":"fleet","since":"2026-11-12T01:00:00Z","reasons":["alarm publish-30m"],"last":{"old":1}}`
+	// disabled_rules: the kill switch's record of the product rules it
+	// turned off; a name that is no product's rule is never enabled.
+	tripped := `{"tripped":true,"scope":"fleet","since":"2026-11-12T01:00:00Z","reasons":["alarm publish-30m"],` +
+		`"disabled_rules":["vaktus_readings","esp32_ztp_secret_rule","nosuch_rule"],"last":{"old":1}}`
 	ssmf.params["/guard"] = tripped
 	f.denied = []string{fleet, a.cfg.Quarantine.ARN}
 
@@ -231,8 +234,13 @@ func TestGuardReset(t *testing.T) {
 	if !slices.Equal(f.denied, []string{a.cfg.Quarantine.ARN}) {
 		t.Errorf("deny-all left on %v", f.denied)
 	}
-	if !slices.Contains(f.calls, "enable esp32_ztp_presence") {
+	if !slices.Contains(f.calls, "enable esp32_ztp_presence") || !slices.Contains(f.calls, "enable vaktus_readings") {
 		t.Errorf("rules not restored: %v", f.calls)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "secret_rule") || strings.Contains(c, "nosuch") {
+			t.Errorf("enabled a rule that is no product's: %v", f.calls)
+		}
 	}
 	var st struct {
 		Tripped bool           `json:"tripped"`

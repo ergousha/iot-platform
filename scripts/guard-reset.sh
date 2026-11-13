@@ -6,11 +6,14 @@
 # 1. Shows the guard state (scope, since when, why).
 # 2. Detaches the deny-all policy from every target except the quarantine
 #    group: the fleet groups come back, devices reconnect on their next retry.
-# 3. Clears the state, so claim-window.sh works again.
+# 3. Enables the product rules (<id>_*) the trip disabled, as the guard
+#    state lists them (disabled_rules).
+# 4. Clears the state, so claim-window.sh works again.
 #
 # It does not re-activate the claim (INACTIVE is its normal state) and does not
-# re-enable the telemetry rules: the next `terraform apply` sets them to the
-# configured debug_telemetry_logs value. Needs the owner's AWS credentials and jq.
+# re-enable the platform's presence rule: the next `terraform apply` does
+# (the portal's "Reset guard" does both). Needs the owner's AWS credentials
+# and jq.
 set -euo pipefail
 
 yes="${1:-}"
@@ -60,9 +63,19 @@ if [[ -n "$left" ]]; then
   exit 1
 fi
 
+# Only names shaped like a product rule; the kill switch recorded these.
+# The loop runs at the top level (not in a pipeline) so set -e stops the
+# script if an enable fails, before the state is cleared.
+rules=$(jq -r '.disabled_rules // [] | .[]' <<<"$state" | { grep -E '^[a-z][a-z0-9]{1,15}_[A-Za-z0-9_]+$' || true; })
+while IFS= read -r rule; do
+  [[ -z "$rule" ]] && continue
+  aws iot enable-topic-rule --rule-name "$rule"
+  echo "enabled product rule $rule"
+done <<<"$rules"
+
 aws ssm put-parameter --name "$param" --type String --overwrite \
   --value "$(jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{tripped: false, reset_at: $at, last: del(.last)}' <<<"$state")" >/dev/null
-echo "guard reset. Devices reconnect on their next retry; run terraform apply to restore the rules."
+echo "guard reset. Devices reconnect on their next retry; run terraform apply to restore the presence rule."
 
 # A budget's ACTUAL alert fires once per month: one already over its limit
 # only re-alerts at 150 %.

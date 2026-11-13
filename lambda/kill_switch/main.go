@@ -7,7 +7,12 @@
 //	provisioning  the claim certificate goes INACTIVE (no enrolment at all);
 //	              it is found through the claim policy, since the OTA
 //	              controller rotates it
-//	traffic       also disables the killable IoT rules (telemetry -> Logs)
+//	traffic       also disables the killable IoT rules: the platform's own
+//	              (KILLABLE_RULES) and every enabled product rule, which is
+//	              any rule named <product>_* (a product's cloud/ root, and the
+//	              Basic Ingest topics $aws/rules/<product>_*). The product
+//	              rules it disabled are recorded, so a guard reset enables
+//	              exactly those again
 //	fleet         also attaches the deny-all policy to every fleet thing group:
 //	              each device is refused on its next publish or connect, the
 //	              fleet goes offline and its messaging cost stops
@@ -27,6 +32,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -40,6 +46,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 )
+
+// productRulePrefix is a product id (plan §5) and the underscore that ends it
+// in a rule name; product ids have no underscore, so no prefix is another's.
+var productRulePrefix = regexp.MustCompile(`^[a-z][a-z0-9]{1,15}_$`)
 
 // Scope is how far a trip goes. Higher includes lower.
 type Scope int
@@ -77,13 +87,15 @@ func parseScope(name string) (Scope, error) {
 
 // Config is the Lambda's environment.
 type Config struct {
-	AlarmScopes    map[string]Scope
-	BudgetScopes   map[string]Scope
-	ClaimPolicy    string
-	KillableRules  []string
-	DenyPolicy     string
-	FleetGroupARNs []string
-	StateParameter string
+	AlarmScopes   map[string]Scope
+	BudgetScopes  map[string]Scope
+	ClaimPolicy   string
+	KillableRules []string
+	// ProductRulePrefixes are "<product>_": rules named so are killable.
+	ProductRulePrefixes []string
+	DenyPolicy          string
+	FleetGroupARNs      []string
+	StateParameter      string
 }
 
 func parseScopes(name, value string) (map[string]Scope, error) {
@@ -129,6 +141,15 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	if c.KillableRules, err = parseList("KILLABLE_RULES", getenv("KILLABLE_RULES")); err != nil {
 		errs = append(errs, err)
 	}
+	if c.ProductRulePrefixes, err = parseList("PRODUCT_RULE_PREFIXES", getenv("PRODUCT_RULE_PREFIXES")); err != nil {
+		errs = append(errs, err)
+	} else {
+		for _, prefix := range c.ProductRulePrefixes {
+			if !productRulePrefix.MatchString(prefix) {
+				errs = append(errs, fmt.Errorf("PRODUCT_RULE_PREFIXES: %q is not <product id>_", prefix))
+			}
+		}
+	}
 	if c.FleetGroupARNs, err = parseList("FLEET_GROUP_ARNS", getenv("FLEET_GROUP_ARNS")); err != nil {
 		errs = append(errs, err)
 	} else if len(c.FleetGroupARNs) == 0 {
@@ -150,6 +171,7 @@ type IoTAPI interface {
 	ListTargetsForPolicy(ctx context.Context, params *iot.ListTargetsForPolicyInput, optFns ...func(*iot.Options)) (*iot.ListTargetsForPolicyOutput, error)
 	UpdateCertificate(ctx context.Context, params *iot.UpdateCertificateInput, optFns ...func(*iot.Options)) (*iot.UpdateCertificateOutput, error)
 	DisableTopicRule(ctx context.Context, params *iot.DisableTopicRuleInput, optFns ...func(*iot.Options)) (*iot.DisableTopicRuleOutput, error)
+	ListTopicRules(ctx context.Context, params *iot.ListTopicRulesInput, optFns ...func(*iot.Options)) (*iot.ListTopicRulesOutput, error)
 	AttachPolicy(ctx context.Context, params *iot.AttachPolicyInput, optFns ...func(*iot.Options)) (*iot.AttachPolicyOutput, error)
 }
 
@@ -212,6 +234,9 @@ type GuardState struct {
 	Scope   string   `json:"scope,omitempty"`
 	Since   string   `json:"since,omitempty"`
 	Reasons []string `json:"reasons,omitempty"`
+	// DisabledRules are the product rules this trip disabled while they were
+	// enabled: what a guard reset enables again.
+	DisabledRules []string `json:"disabled_rules,omitempty"`
 }
 
 // readState returns the stored guard state ({} when missing or unreadable).
@@ -282,6 +307,7 @@ func (a *App) writeTrip(ctx context.Context, state GuardState, scope Scope, entr
 	} else {
 		state.Since = a.now().UTC().Format(time.RFC3339)
 		state.Reasons = nil
+		state.DisabledRules = nil
 	}
 	state.Tripped = true
 	state.Scope = enforce.String()
@@ -323,6 +349,11 @@ func (a *App) enforce(ctx context.Context, scope Scope) error {
 			}
 			slog.Info("Rule disabled", "rule", rule)
 		}
+		disabled, err := a.disableProductRules(ctx)
+		errs = append(errs, err)
+		if len(disabled) > 0 {
+			errs = append(errs, a.recordDisabledRules(ctx, disabled))
+		}
 	}
 
 	if scope >= ScopeFleet {
@@ -340,6 +371,84 @@ func (a *App) enforce(ctx context.Context, scope Scope) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// isProductRule reports whether name is a product's rule (<product>_*).
+func (a *App) isProductRule(name string) bool {
+	for _, prefix := range a.cfg.ProductRulePrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// disableProductRules disables every enabled product rule and returns the
+// ones it disabled. Rules already disabled are left out: a reset must not
+// enable a rule its product keeps off (a debug sink, say).
+func (a *App) disableProductRules(ctx context.Context) ([]string, error) {
+	if len(a.cfg.ProductRulePrefixes) == 0 {
+		return nil, nil
+	}
+	var disabled []string
+	var errs []error
+	var token *string
+	for {
+		out, err := a.iot.ListTopicRules(ctx, &iot.ListTopicRulesInput{NextToken: token})
+		if err != nil {
+			return disabled, errors.Join(append(errs, fmt.Errorf("listing the topic rules: %w", err))...)
+		}
+		for _, r := range out.Rules {
+			name := aws.ToString(r.RuleName)
+			if !a.isProductRule(name) || aws.ToBool(r.RuleDisabled) {
+				continue
+			}
+			if _, err := a.iot.DisableTopicRule(ctx, &iot.DisableTopicRuleInput{RuleName: aws.String(name)}); err != nil {
+				errs = append(errs, fmt.Errorf("disabling product rule %s: %w", name, err))
+				continue
+			}
+			slog.Info("Product rule disabled", "rule", name)
+			disabled = append(disabled, name)
+		}
+		if aws.ToString(out.NextToken) == "" {
+			return disabled, errors.Join(errs...)
+		}
+		token = out.NextToken
+	}
+}
+
+// recordDisabledRules adds rules to the trip's disabled_rules, reading back
+// like recordTrip in case a concurrent trip overwrote the record. If the
+// record is lost anyway, the rule stays off after a reset until its
+// product's cloud/ is applied again: cost stays bounded either way.
+func (a *App) recordDisabledRules(ctx context.Context, rules []string) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		state, err := a.readState(ctx)
+		if err != nil {
+			return err
+		}
+		missing := false
+		for _, r := range rules {
+			if !containsString(state.DisabledRules, r) {
+				state.DisabledRules = append(state.DisabledRules, r)
+				missing = true
+			}
+		}
+		if !missing {
+			return nil
+		}
+		sort.Strings(state.DisabledRules)
+		body, _ := json.Marshal(state)
+		if _, err := a.ssm.PutParameter(ctx, &ssm.PutParameterInput{
+			Name:      aws.String(a.cfg.StateParameter),
+			Value:     aws.String(string(body)),
+			Type:      ssmtypes.ParameterTypeString,
+			Overwrite: aws.Bool(true),
+		}); err != nil {
+			return fmt.Errorf("recording the disabled product rules: %w", err)
+		}
+	}
+	return nil
 }
 
 // deactivateClaims sets every certificate the claim policy is attached to
