@@ -2,7 +2,7 @@
 
 This repository contains the Terraform-managed AWS serverless infrastructure that powers **Zero-Touch Fleet Provisioning by Claim (ZTP)** and **Automated, Event-Driven Over-The-Air (OTA) Firmware Updates** for ESP32 devices.
 
-The platform hosts several **products**, listed in the `products` variable ([variables.tf](variables.tf)):
+The platform hosts several **products**, one file each in [products/](products/README.md) (`<id>.json`):
 
 | Product id | Device | Firmware repository | Enrols with |
 | :--- | :--- | :--- | :--- |
@@ -298,6 +298,7 @@ CI runs the same checks: [`ci.yml`](.github/workflows/ci.yml) (Go, Terraform wit
 | `/esp32-ztp/poc/iot_endpoint`, `/esp32-ztp/poc/<product>/provisioning_template_name` | Terraform | anyone (public facts; builds compile them from `platform.toml` now) |
 | `/esp32-ztp/guard/state` | the kill switch, `guard-reset.sh` | the controller, `ergo`, `claim-window.sh` |
 | `/iot-platform/products/<product>/signing_keys` (JSON: key id → public key PEM) | the owner, when creating or rotating signing keys (no Terraform) | the controller |
+| `/iot-platform/products/<product>/platform` (JSON: endpoint, template, groups, release role, bucket, `cloud/` state key, rule prefix) | Terraform | `ergo product init`, the product's `cloud/` root |
 | `/iot-platform/claim/{cert,key}` (SecureString), `/iot-platform/claim/state` | the controller | `ergo commission` only |
 
 ### Secure GitHub Actions OIDC Trust
@@ -310,7 +311,7 @@ Each product has its own role ([iam_github_oidc.tf](iam_github_oidc.tf)), truste
 | `gateway` | `esp32-ztp-github-actions-role` | `releases/gateway/*` |
 | `vaktus` | `esp32-ztp-vaktus-github-actions-role` | `releases/vaktus/*` |
 
-`terraform output github_actions_role_arns` lists them. To add a product, add an entry to the `products` variable in [variables.tf](variables.tf) (its repository's numeric id: `gh api repos/<owner>/<repo> --jq .id`) and apply.
+`terraform output github_actions_role_arns` lists them. A new product comes from the [iot-device-template](https://github.com/ergousha/iot-device-template) repository and `ergo product init` (iot-device-sdk), which opens the pull request for its `products/<id>.json` and applies it once merged; by hand, add the file ([products/README.md](products/README.md)) and apply.
 
 ---
 
@@ -331,7 +332,7 @@ Denial-of-wallet is the main threat to a self-funded platform. [guard.tf](guard.
 The measured baseline was at most 48 publishes and 4 connects per 5 minutes. Each scope includes the ones above it:
 
 * **provisioning**: the claim certificate (every target of the claim policy) goes INACTIVE.
-* **traffic**: the telemetry → CloudWatch Logs rules and the presence rule are disabled (while it lasts, the soak gate sees no reconnects).
+* **traffic**: the presence rule and every enabled product rule (`<product>_*`, from a product's `cloud/`) are disabled (while it lasts, the soak gate sees no reconnects). The product rules it disabled are listed in the guard state (`disabled_rules`); a reset, from the portal or `guard-reset.sh`, enables exactly those again.
 * **fleet**: the deny-all policy `esp32-ztp-guard-deny-all` is attached to every fleet and excluded group. Every device is refused on its next publish or connect, so the fleet goes offline and messaging cost stops.
 
 Every trip is recorded in the SSM parameter `/esp32-ztp/guard/state`. `claim-window.sh` refuses to open a window while it is tripped. Once you know why it tripped:
@@ -441,13 +442,13 @@ All resources deployed in this repository are serverless and billed purely on-de
 | **DynamoDB** | PAY_PER_REQUEST (On-Demand), capped at 2 reads and 2 writes per second; PITR on | Billed per request (a few a month); PITR about $0.000001 a month |
 | **AWS Lambda** | per invocation & duration | Billed per millisecond; free tier covers PoC |
 | **Amazon S3** | per GB-month & requests | Storage cost for binaries is fractions of a cent |
-| **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; telemetry routing off by default |
+| **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; no telemetry is routed here by the platform |
 | **CloudFront** (firmware) | Free flat-rate plan | $0, no overage (attach the plan in the console after the first apply; see [cloudfront.tf](cloudfront.tf)) |
 | **EventBridge Scheduler** | 2,976 ticks a month | $0 (14M free invocations) |
 | **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: 8 of the 10 free alarm metrics, a handful of messages, budgets without actions |
 | **Portal**: Cognito Essentials, identity pool, CloudFront (Free plan), S3 | per MAU (Essentials: free up to 10,000) | $0 |
 
-Telemetry is not routed to CloudWatch Logs by default (`debug_telemetry_logs = false`): every message would be billed as a rule, an action and Logs ingestion. Turn it on for a debugging session or a gateway HIL run (`terraform apply -var debug_telemetry_logs=true`), and off again afterwards.
+The platform keeps no telemetry rules. A product's rules live in its own `cloud/` Terraform root (state `products/<id>/cloud.tfstate` in the state bucket), are named `<id>_*` so the kill switch can disable them, and follow the SDK's capped-target rules (`PLATFORM.md` in iot-device-sdk). The gateway's OPC UA debug rule, off by default, is in its repository's `cloud/` (`terraform apply -var debug_telemetry_logs=true` there for a HIL run).
 
 ### Teardown
 To destroy all Terraform-managed resources:

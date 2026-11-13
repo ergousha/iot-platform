@@ -198,9 +198,18 @@ func (a *App) decommission(ctx context.Context, p ProductConfig, o Override) (Re
 			"`ergo commission --reprovision` brings it back.", o.Thing, strings.Join(log, "; ")), o.by)
 }
 
+// isProductRule reports whether name is one of the products' rules
+// (<product>_*, plan §7): the only rules besides RestoreRules a reset enables.
+func (a *App) isProductRule(name string) bool {
+	id, _, found := strings.Cut(name, "_")
+	_, known := a.cfg.Products[id]
+	return found && known
+}
+
 // guardReset undoes a kill-switch trip, like scripts/guard-reset.sh: the
 // deny-all policy comes off every target but the quarantine group, the rules
-// Terraform keeps enabled are enabled again, and the state is cleared. The
+// Terraform keeps enabled and the product rules the trip disabled are enabled
+// again, and the state is cleared. The
 // claim stays INACTIVE (its normal state; the tick arms it for windows).
 func (a *App) guardReset(ctx context.Context, by string) (Result, error) {
 	read := func() (string, error) {
@@ -248,7 +257,13 @@ func (a *App) guardReset(ctx context.Context, by string) (Result, error) {
 	if left, err := denied(); err != nil || len(left) > 0 {
 		return Result{Log: log}, fmt.Errorf("deny-all is still attached to %v (%v); the guard stays tripped", left, err)
 	}
-	for _, r := range a.cfg.RestoreRules {
+	restore := append([]string(nil), a.cfg.RestoreRules...)
+	for _, r := range g.DisabledRules {
+		if a.isProductRule(r) && !slices.Contains(restore, r) {
+			restore = append(restore, r)
+		}
+	}
+	for _, r := range restore {
 		if _, err := a.iot.EnableTopicRule(ctx, &iot.EnableTopicRuleInput{RuleName: aws.String(r)}); err != nil {
 			return Result{Log: log}, fmt.Errorf("enabling rule %s: %w", r, err)
 		}
