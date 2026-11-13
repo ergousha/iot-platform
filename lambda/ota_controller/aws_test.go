@@ -509,8 +509,9 @@ func (f fakeHTTP) Do(*http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(f.body))}, nil
 }
 
-// Only the release workflow's pre-releases (with a manifest.sig) can be
-// orphans; a pre-release from before it, like vaktus v0.0.1, is not one.
+// Only the release workflow's releases (with a manifest.sig), pre-release or
+// not, can be orphans; a pre-release from before it, like vaktus v0.0.1, is
+// not one.
 func TestOrphansAreWorkflowReleasesMissingInS3(t *testing.T) {
 	a, _, _, _, _, _ := testApp()
 	old := t0.Add(-2 * time.Hour).Format(time.RFC3339)
@@ -531,7 +532,7 @@ func TestOrphansAreWorkflowReleasesMissingInS3(t *testing.T) {
 	v5, _ := ParseVersion("0.9.5")
 	s.Releases = []Release{{Version: v5}}
 	got := a.orphans(context.Background(), ProductConfig{ID: "vaktus", Repository: "ergousha/vaktus"}, s)
-	if strings.Join(got, ",") != "0.9.3" {
-		t.Fatalf("orphans %v, want [0.9.3]", got)
+	if strings.Join(got, ",") != "0.9.3,0.9.6" {
+		t.Fatalf("orphans %v, want [0.9.3 0.9.6]", got)
 	}
 }
