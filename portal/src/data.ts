@@ -71,24 +71,22 @@ export interface RegistryRecord {
   provisioned: boolean;
   canary: boolean;
   enrolBy?: number; // unix seconds
-  legacy: boolean; // written by hand before products existed: no product attribute
-  via?: string; // how it enrolled: public_key or secret
+  via?: string; // how it enrolled: public_key (or, before Phase 6, secret)
   enrolledAt?: string; // RFC 3339
   raw: Record<string, Plain>;
 }
 
-/** The legacy product owns records written before products existed. */
-export function registryRecord(item: Record<string, Plain>, legacyProduct: string): RegistryRecord {
+/** A record without a product (none should remain) enrols nothing: product "". */
+export function registryRecord(item: Record<string, Plain>): RegistryRecord {
   const mac = typeof item.mac_address === "string" ? item.mac_address : "";
   return {
     mac,
     thing: mac.replace(/[^0-9A-Fa-f]/g, "").toUpperCase(),
-    product: typeof item.product === "string" ? item.product : legacyProduct,
+    product: typeof item.product === "string" ? item.product : "",
     allowed: item.allowed === true,
     provisioned: item.provisioned === true,
     canary: item.canary === true,
     enrolBy: typeof item.enrol_by === "number" ? item.enrol_by : undefined,
-    legacy: typeof item.product !== "string",
     via: typeof item.last_provisioned_via === "string" ? item.last_provisioned_via : undefined,
     enrolledAt: typeof item.last_provisioned_at === "string" ? item.last_provisioned_at : undefined,
     raw: item,
@@ -135,8 +133,8 @@ export function enrolment(r: RegistryRecord, nowMs: number): Badge {
 }
 
 export const enrolMethods: Record<string, string> = {
-  public_key: "Secure-element key",
-  secret: "Shared secret",
+  public_key: "Device key",
+  secret: "Shared secret (retired)",
 };
 
 const bootReasons: Record<string, [string, Tone]> = {

@@ -5,7 +5,6 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
-	"crypto/subtle"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
@@ -47,22 +46,20 @@ type PreProvisioningResponse struct {
 
 // DeviceItem matches the schema of the DynamoDB Device Registry.
 //
-// product is the product the device may enrol as; a record written before
-// products existed has none and belongs to the legacy product. public_key, when
-// set, is the key the device's certificate must carry: the device proves itself
-// with the key in its secure element, and the secret is not consulted. It is a
-// PEM "PUBLIC KEY" block, or the hex of an uncompressed P-256 point (130 hex
-// digits starting 04, or the 128 digits of X||Y as an ATECC608 GenKey returns
-// them).
+// product is the product the device may enrol as; a record without one enrols
+// nothing. public_key is the key the device's certificate must carry: the
+// device proves itself with the key in its secure element or NVS, and there is
+// no other way to enrol. It is a PEM "PUBLIC KEY" block, or the hex of an
+// uncompressed P-256 point (130 hex digits starting 04, or the 128 digits of
+// X||Y as an ATECC608 GenKey returns them).
 //
 // A record enrols a device ONCE: provisioned=true rejects every later request,
-// so a leaked claim (or the public gateway secret) cannot enrol a second copy of
-// a device. Re-enrolling (a new key, an erased NVS) means re-registering the
-// device at the bench, which resets provisioned. enrol_by, when set (Unix
-// seconds), closes the record's enrolment window.
+// so a leaked claim cannot enrol a second copy of a device. Re-enrolling (a new
+// key, an erased NVS) means re-registering the device at the bench, which
+// resets provisioned. enrol_by, when set (Unix seconds), closes the record's
+// enrolment window.
 type DeviceItem struct {
 	MacAddress  string `dynamodbav:"mac_address"`
-	Secret      string `dynamodbav:"secret"`
 	Allowed     bool   `dynamodbav:"allowed"`
 	Provisioned bool   `dynamodbav:"provisioned"`
 	Product     string `dynamodbav:"product"`
@@ -70,11 +67,9 @@ type DeviceItem struct {
 	EnrolBy     int64  `dynamodbav:"enrol_by"`
 }
 
-// TemplateProduct is what a provisioning template enrols: a product, and
-// whether that product must prove itself with a registered public key.
+// TemplateProduct is what a provisioning template enrols.
 type TemplateProduct struct {
-	Product          string `json:"product"`
-	RequirePublicKey bool   `json:"require_public_key"`
+	Product string `json:"product"`
 }
 
 // DynamoDBAPI defines the DynamoDB operations utilized by this Lambda.
@@ -90,8 +85,6 @@ type App struct {
 
 	// templates maps a provisioning template name to what it enrols.
 	templates map[string]TemplateProduct
-	// legacyRecordProduct owns registry records without a product ("" = none).
-	legacyRecordProduct string
 	// now is the clock enrol_by is checked against (nil = time.Now).
 	now func() time.Time
 }
@@ -110,7 +103,6 @@ var reject = PreProvisioningResponse{AllowProvisioning: false}
 // closed.
 func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvisioningResponse, error) {
 	rawMAC := event.Parameters["MacAddress"]
-	secret := event.Parameters["Secret"]
 	serial := event.Parameters["SerialNumber"]
 	templateName := templateNameFromARN(event.TemplateARN)
 
@@ -190,48 +182,32 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		return reject, nil
 	}
 
-	recordProduct := item.Product
-	if recordProduct == "" {
-		recordProduct = a.legacyRecordProduct
-	}
-	if recordProduct == "" || recordProduct != tmpl.Product {
+	if item.Product == "" || item.Product != tmpl.Product {
 		slog.Warn("REJECTED: device is not registered for this template's product",
-			"mac", mac, "registeredProduct", recordProduct, "templateProduct", tmpl.Product)
+			"mac", mac, "registeredProduct", item.Product, "templateProduct", tmpl.Product)
 		return reject, nil
 	}
 
-	var method string
-	switch {
-	case item.PublicKey != "" || tmpl.RequirePublicKey:
-		// The device holds its key in a secure element: the certificate AWS IoT
-		// issued must be for exactly the key registered for this device. A
-		// leaked claim credential or shared secret cannot satisfy this.
-		if item.PublicKey == "" {
-			slog.Warn("REJECTED: product requires a registered public key, record has none",
-				"mac", mac, "product", tmpl.Product)
-			return reject, nil
-		}
-		registered, err := parsePublicKey(item.PublicKey)
-		if err != nil {
-			slog.Error("REJECTED: registry record has an unreadable public_key", "mac", mac, "error", err)
-			return reject, nil
-		}
-		presented, err := certificatePublicKey(event.CertificatePem)
-		if err != nil {
-			slog.Warn("REJECTED: no usable certificate in the request", "mac", mac, "error", err)
-			return reject, nil
-		}
-		if !publicKeysEqual(registered, presented) {
-			slog.Warn("REJECTED: certificate public key does not match the registered key", "mac", mac)
-			return reject, nil
-		}
-		method = "public_key"
-	default:
-		if secret == "" || !constantTimeEq(item.Secret, secret) {
-			slog.Warn("REJECTED: secret missing or mismatched", "mac", mac)
-			return reject, nil
-		}
-		method = "secret"
+	// The certificate AWS IoT issued must be for exactly the key registered for
+	// this device: only the device holding that key can enrol, not a holder of
+	// the (shared, extractable) claim.
+	if item.PublicKey == "" {
+		slog.Warn("REJECTED: record has no registered public key", "mac", mac)
+		return reject, nil
+	}
+	registered, err := parsePublicKey(item.PublicKey)
+	if err != nil {
+		slog.Error("REJECTED: registry record has an unreadable public_key", "mac", mac, "error", err)
+		return reject, nil
+	}
+	presented, err := certificatePublicKey(event.CertificatePem)
+	if err != nil {
+		slog.Warn("REJECTED: no usable certificate in the request", "mac", mac, "error", err)
+		return reject, nil
+	}
+	if !publicKeysEqual(registered, presented) {
+		slog.Warn("REJECTED: certificate public key does not match the registered key", "mac", mac)
+		return reject, nil
 	}
 
 	// Claim the record. The condition makes this the single enrolment even when
@@ -249,7 +225,7 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 			":f":  &types.AttributeValueMemberBOOL{Value: false},
 			":s":  &types.AttributeValueMemberS{Value: thingName},
 			":c":  &types.AttributeValueMemberS{Value: event.CertificateID},
-			":m":  &types.AttributeValueMemberS{Value: method},
+			":m":  &types.AttributeValueMemberS{Value: "public_key"},
 			":at": &types.AttributeValueMemberS{Value: a.clock().UTC().Format(time.RFC3339)},
 		},
 	})
@@ -263,7 +239,7 @@ func (a *App) Handler(ctx context.Context, event PreProvisioningEvent) (PreProvi
 		return reject, nil
 	}
 
-	slog.Info("APPROVED: provisioning allowed", "mac", mac, "product", tmpl.Product, "via", method)
+	slog.Info("APPROVED: provisioning allowed", "mac", mac, "product", tmpl.Product)
 	return PreProvisioningResponse{
 		AllowProvisioning: true,
 		ParameterOverrides: map[string]string{
@@ -361,11 +337,6 @@ func publicKeysEqual(a, b crypto.PublicKey) bool {
 	return ok && b != nil && ka.Equal(b)
 }
 
-// constantTimeEq compares two strings in constant time to prevent timing attacks.
-func constantTimeEq(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
-}
-
 // loadTemplates parses PRODUCTS_BY_TEMPLATE: template name -> TemplateProduct.
 func loadTemplates(value string) (map[string]TemplateProduct, error) {
 	var templates map[string]TemplateProduct
@@ -407,10 +378,9 @@ func main() {
 	}
 
 	app := &App{
-		dbClient:            dynamodb.NewFromConfig(cfg),
-		tableName:           tableName,
-		templates:           templates,
-		legacyRecordProduct: os.Getenv("LEGACY_RECORD_PRODUCT"),
+		dbClient:  dynamodb.NewFromConfig(cfg),
+		tableName: tableName,
+		templates: templates,
 	}
 
 	lambda.Start(app.Handler)

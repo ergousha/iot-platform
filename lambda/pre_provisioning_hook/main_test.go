@@ -57,7 +57,7 @@ const (
 func testTemplates() map[string]TemplateProduct {
 	return map[string]TemplateProduct{
 		gatewayTemplate: {Product: "gateway"},
-		vaktusTemplate:  {Product: "vaktus", RequirePublicKey: true},
+		vaktusTemplate:  {Product: "vaktus"},
 	}
 }
 
@@ -140,17 +140,30 @@ func TestHandler(t *testing.T) {
 	device := newDeviceKey(t)
 	other := newDeviceKey(t)
 
-	// A gateway record from before products existed: no product, no key.
-	legacyGateway := map[string]types.AttributeValue{
-		"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true),
-	}
-	vaktusRecord := func(publicKey string) map[string]types.AttributeValue {
+	keyRecord := func(product, publicKey string) map[string]types.AttributeValue {
 		return map[string]types.AttributeValue{
-			"mac_address": s(testMAC), "product": s("vaktus"), "allowed": b(true), "public_key": s(publicKey),
+			"mac_address": s(testMAC), "product": s(product), "allowed": b(true), "public_key": s(publicKey),
 		}
 	}
-	gatewayParams := map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182B8456F4"}
-	vaktusParams := map[string]string{"MacAddress": testMAC, "SerialNumber": "38182B8456F4"}
+	gatewayRecord := keyRecord("gateway", device.rawXY())
+	vaktusRecord := func(publicKey string) map[string]types.AttributeValue { return keyRecord("vaktus", publicKey) }
+	params := map[string]string{"MacAddress": testMAC, "SerialNumber": "38182B8456F4"}
+	gateway := func(p map[string]string) PreProvisioningEvent {
+		return PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificatePem: device.certPEM, Parameters: p}
+	}
+	vaktus := func(p map[string]string) PreProvisioningEvent {
+		return PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: p}
+	}
+	with := func(attrs map[string]types.AttributeValue, extra map[string]types.AttributeValue) map[string]types.AttributeValue {
+		out := map[string]types.AttributeValue{}
+		for k, v := range attrs {
+			out[k] = v
+		}
+		for k, v := range extra {
+			out[k] = v
+		}
+		return out
+	}
 
 	tests := []struct {
 		name            string
@@ -158,29 +171,20 @@ func TestHandler(t *testing.T) {
 		getItemFunc     func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
 		updateItemFunc  func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
 		wantAllow       bool
-		wantVia         string // last_provisioned_via written on approval
 		wantNoLookup    bool
 		wantUpdateTried bool // rejected, but only after trying to record the enrolment
 	}{
-		// --- Secret-based products (the gateway) ---
+		// --- The gateway (NVS soft key) ---
 		{
-			name:        "Gateway - legacy record approved with its secret",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificateID: "cert-1", Parameters: gatewayParams},
-			getItemFunc: record(legacyGateway),
+			name:        "Gateway - certificate key matches the registered key",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificateID: "cert-1", CertificatePem: device.certPEM, Parameters: params},
+			getItemFunc: record(gatewayRecord),
 			wantAllow:   true,
-			wantVia:     "secret",
-		},
-		{
-			name:        "Gateway - record with product gateway approved",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "product": s("gateway")}),
-			wantAllow:   true,
-			wantVia:     "secret",
 		},
 		{
 			name:        "Rejected - the enrolment cannot be recorded (fail closed)",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(legacyGateway),
+			event:       gateway(params),
+			getItemFunc: record(gatewayRecord),
 			updateItemFunc: func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
 				return nil, errors.New("database update error")
 			},
@@ -188,208 +192,183 @@ func TestHandler(t *testing.T) {
 		},
 		{
 			name:        "Rejected - a concurrent request enrolled the record first",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(legacyGateway),
+			event:       gateway(params),
+			getItemFunc: record(gatewayRecord),
 			updateItemFunc: func(ctx context.Context, params *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
 				return nil, &types.ConditionalCheckFailedException{Message: aws.String("The conditional request failed")}
 			},
 			wantUpdateTried: true,
 		},
 
+		// --- No shared secret: only a registered key enrols ---
+		{
+			name:  "Rejected - a gateway record with only a secret (the secret path is gone)",
+			event: gateway(map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182B8456F4"}),
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "product": s("gateway"), "secret": s("supersecret"), "allowed": b(true),
+			}),
+		},
+		{
+			name:  "Rejected - a record without product (no legacy product any more)",
+			event: gateway(params),
+			getItemFunc: record(map[string]types.AttributeValue{
+				"mac_address": s(testMAC), "allowed": b(true), "public_key": s(device.rawXY()),
+			}),
+		},
+		{
+			name:        "Gateway - certificate for another key",
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificatePem: other.certPEM, Parameters: params},
+			getItemFunc: record(gatewayRecord),
+		},
+
 		// --- One enrolment per record, inside its window ---
 		{
-			name:  "Rejected - already provisioned (a clone with the public secret)",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "provisioned": b(true),
-			}),
+			name:        "Rejected - already provisioned, even with its own key",
+			event:       vaktus(params),
+			getItemFunc: record(with(vaktusRecord(device.rawXY()), map[string]types.AttributeValue{"provisioned": b(true)})),
 		},
 		{
-			name:  "Rejected - vaktus already provisioned, even with its own key",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "product": s("vaktus"), "allowed": b(true), "public_key": s(device.rawXY()), "provisioned": b(true),
-			}),
+			name:        "Approved - provisioned=false is a fresh record",
+			event:       gateway(params),
+			getItemFunc: record(with(gatewayRecord, map[string]types.AttributeValue{"provisioned": b(false)})),
+			wantAllow:   true,
 		},
 		{
-			name:  "Approved - provisioned=false is a fresh record",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "provisioned": b(false),
-			}),
-			wantAllow: true,
-			wantVia:   "secret",
+			name:        "Approved - inside the enrolment window",
+			event:       gateway(params),
+			getItemFunc: record(with(gatewayRecord, map[string]types.AttributeValue{"enrol_by": n(fixedNow.Unix() + 60)})),
+			wantAllow:   true,
 		},
 		{
-			name:  "Approved - inside the enrolment window",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "enrol_by": n(fixedNow.Unix() + 60),
-			}),
-			wantAllow: true,
-			wantVia:   "secret",
-		},
-		{
-			name:  "Rejected - the enrolment window has closed",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "enrol_by": n(fixedNow.Unix() - 1),
-			}),
+			name:        "Rejected - the enrolment window has closed",
+			event:       gateway(params),
+			getItemFunc: record(with(gatewayRecord, map[string]types.AttributeValue{"enrol_by": n(fixedNow.Unix() - 1)})),
 		},
 
 		// --- MAC spellings ---
 		{
 			name:        "Approved - lowercase MAC with dashes finds the AA:BB:.. record",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38-18-2b-84-56-f4", "Secret": "supersecret", "SerialNumber": "38182B8456F4"}},
-			getItemFunc: lookupMust(testMAC, legacyGateway),
+			event:       gateway(map[string]string{"MacAddress": "38-18-2b-84-56-f4", "SerialNumber": "38182B8456F4"}),
+			getItemFunc: lookupMust(testMAC, gatewayRecord),
 			wantAllow:   true,
-			wantVia:     "secret",
 		},
 		{
 			name:        "Approved - MAC without separators",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38182b8456f4", "Secret": "supersecret", "SerialNumber": "38182B8456F4"}},
-			getItemFunc: lookupMust(testMAC, legacyGateway),
+			event:       gateway(map[string]string{"MacAddress": "38182b8456f4", "SerialNumber": "38182B8456F4"}),
+			getItemFunc: lookupMust(testMAC, gatewayRecord),
 			wantAllow:   true,
-			wantVia:     "secret",
 		},
 		{
 			name:         "Rejected - MAC is not 12 hex digits",
-			event:        PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": "38:18:2B:84:56:G4", "Secret": "supersecret", "SerialNumber": "38182B8456G4"}},
+			event:        gateway(map[string]string{"MacAddress": "38:18:2B:84:56:G4", "SerialNumber": "38182B8456G4"}),
 			wantNoLookup: true,
-		},
-		{
-			name:        "Gateway - secret missing",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "SerialNumber": "38182B8456F4"}},
-			getItemFunc: record(legacyGateway),
-		},
-		{
-			name:        "Gateway - secret mismatch",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "wrongsecret", "SerialNumber": "38182B8456F4"}},
-			getItemFunc: record(legacyGateway),
-		},
-		{
-			name:  "Gateway - a registered key is required even for a secret product",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificatePem: other.certPEM, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true), "public_key": s(device.rawXY()),
-			}),
 		},
 
 		// --- The thing name is the MAC ---
 		{
 			name:        "Rejected - SerialNumber names another thing (a gateway's)",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: map[string]string{"MacAddress": testMAC, "SerialNumber": "28848553144F"}},
+			event:       vaktus(map[string]string{"MacAddress": testMAC, "SerialNumber": "28848553144F"}),
 			getItemFunc: record(vaktusRecord(device.rawXY())),
 		},
 		{
 			name:        "Rejected - SerialNumber missing",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "supersecret"}},
-			getItemFunc: record(legacyGateway),
+			event:       gateway(map[string]string{"MacAddress": testMAC}),
+			getItemFunc: record(gatewayRecord),
 		},
 		{
-			name:        "Gateway - lowercase SerialNumber is not the thing name",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182b8456f4"}},
-			getItemFunc: record(legacyGateway),
+			name:        "Rejected - lowercase SerialNumber is not the thing name",
+			event:       gateway(map[string]string{"MacAddress": testMAC, "SerialNumber": "38182b8456f4"}),
+			getItemFunc: record(gatewayRecord),
 		},
 
 		// --- Common checks ---
 		{
 			name:         "Rejected - missing MAC address",
-			event:        PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: map[string]string{"Secret": "supersecret"}},
+			event:        gateway(map[string]string{"SerialNumber": "38182B8456F4"}),
 			wantNoLookup: true,
 		},
 		{
 			name:         "Rejected - unknown template",
-			event:        PreProvisioningEvent{TemplateARN: templateARNPrefix + "someone-elses-template", Parameters: gatewayParams},
+			event:        PreProvisioningEvent{TemplateARN: templateARNPrefix + "someone-elses-template", CertificatePem: device.certPEM, Parameters: params},
 			wantNoLookup: true,
 		},
 		{
 			name:         "Rejected - no template ARN",
-			event:        PreProvisioningEvent{Parameters: gatewayParams},
+			event:        PreProvisioningEvent{CertificatePem: device.certPEM, Parameters: params},
 			wantNoLookup: true,
 		},
 		{
 			name:  "Rejected - DynamoDB error",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			event: gateway(params),
 			getItemFunc: func(ctx context.Context, params *dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error) {
 				return nil, errors.New("dynamo read error")
 			},
 		},
 		{
 			name:        "Rejected - item not found",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
+			event:       gateway(params),
 			getItemFunc: record(nil),
 		},
 		{
 			name:        "Rejected - allowed=false",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(false)}),
+			event:       gateway(params),
+			getItemFunc: record(with(gatewayRecord, map[string]types.AttributeValue{"allowed": b(false)})),
 		},
 
-		// --- Public-key products (Vaktus, ATECC608) ---
+		// --- Key formats and broken keys (Vaktus, ATECC608) ---
 		{
 			name:        "Vaktus - certificate key matches the registered X||Y",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificateID: "cert-2", CertificatePem: device.certPEM, Parameters: vaktusParams},
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificateID: "cert-2", CertificatePem: device.certPEM, Parameters: params},
 			getItemFunc: record(vaktusRecord(device.rawXY())),
 			wantAllow:   true,
-			wantVia:     "public_key",
 		},
 		{
 			name:        "Vaktus - registered key with 04 prefix, lowercase and colons",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
+			event:       vaktus(params),
 			getItemFunc: record(vaktusRecord(colons("04" + strings.ToLower(device.rawXY())))),
 			wantAllow:   true,
-			wantVia:     "public_key",
 		},
 		{
 			name:        "Vaktus - registered key as PEM",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
+			event:       vaktus(params),
 			getItemFunc: record(vaktusRecord(device.pem())),
 			wantAllow:   true,
-			wantVia:     "public_key",
 		},
 		{
-			name:        "Vaktus - certificate for another key",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: other.certPEM, Parameters: vaktusParams},
-			getItemFunc: record(vaktusRecord(device.rawXY())),
-		},
-		{
-			name:  "Vaktus - a correct secret is not enough without a registered key",
-			event: PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: gatewayParams},
-			getItemFunc: record(map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "product": s("vaktus"), "secret": s("supersecret"), "allowed": b(true),
-			}),
+			name:        "Vaktus - no registered key",
+			event:       vaktus(params),
+			getItemFunc: record(map[string]types.AttributeValue{"mac_address": s(testMAC), "product": s("vaktus"), "allowed": b(true)}),
 		},
 		{
 			name:        "Vaktus - no certificate in the request",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, Parameters: vaktusParams},
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, Parameters: params},
 			getItemFunc: record(vaktusRecord(device.rawXY())),
 		},
 		{
 			name:        "Vaktus - certificatePem is not a certificate",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.pem(), Parameters: vaktusParams},
+			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.pem(), Parameters: params},
 			getItemFunc: record(vaktusRecord(device.rawXY())),
 		},
 		{
 			name:        "Vaktus - registered key is not a point on the curve",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
+			event:       vaktus(params),
 			getItemFunc: record(vaktusRecord(strings.Repeat("11", 64))),
 		},
 		{
 			name:        "Vaktus - registered key is garbage",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: vaktusParams},
+			event:       vaktus(params),
 			getItemFunc: record(vaktusRecord("not-a-key")),
 		},
 
 		// --- A device can only enrol as its own product ---
 		{
 			name:        "Cross-product - gateway record through the vaktus template",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + vaktusTemplate, CertificatePem: device.certPEM, Parameters: gatewayParams},
-			getItemFunc: record(legacyGateway),
+			event:       vaktus(params),
+			getItemFunc: record(gatewayRecord),
 		},
 		{
 			name:        "Cross-product - vaktus record through the gateway template",
-			event:       PreProvisioningEvent{TemplateARN: templateARNPrefix + gatewayTemplate, CertificatePem: device.certPEM, Parameters: gatewayParams},
+			event:       gateway(params),
 			getItemFunc: record(vaktusRecord(device.rawXY())),
 		},
 	}
@@ -412,11 +391,10 @@ func TestHandler(t *testing.T) {
 			}
 
 			app := &App{
-				dbClient:            mockClient,
-				tableName:           tableName,
-				templates:           testTemplates(),
-				legacyRecordProduct: "gateway",
-				now:                 func() time.Time { return fixedNow },
+				dbClient:  mockClient,
+				tableName: tableName,
+				templates: testTemplates(),
+				now:       func() time.Time { return fixedNow },
 			}
 
 			resp, err := app.Handler(context.Background(), tt.event)
@@ -452,8 +430,8 @@ func TestHandler(t *testing.T) {
 				t.Errorf("expected table name %s, got %s", tableName, *upd.TableName)
 			}
 			via := upd.ExpressionAttributeValues[":m"].(*types.AttributeValueMemberS).Value
-			if via != tt.wantVia {
-				t.Errorf("expected last_provisioned_via %q, got %q", tt.wantVia, via)
+			if via != "public_key" {
+				t.Errorf("expected last_provisioned_via public_key, got %q", via)
 			}
 			certID := upd.ExpressionAttributeValues[":c"].(*types.AttributeValueMemberS).Value
 			if certID != tt.event.CertificateID {
@@ -471,25 +449,6 @@ func TestHandler(t *testing.T) {
 	}
 }
 
-// Without a legacy product, a record that names no product belongs to none.
-func TestRecordWithoutProductAndNoLegacyProduct(t *testing.T) {
-	mockClient := &MockDynamoDBClient{
-		GetItemFunc: func(ctx context.Context, params *dynamodb.GetItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
-			return &dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{
-				"mac_address": s(testMAC), "secret": s("supersecret"), "allowed": b(true),
-			}}, nil
-		},
-	}
-	app := &App{dbClient: mockClient, tableName: tableName, templates: testTemplates()}
-	resp, err := app.Handler(context.Background(), PreProvisioningEvent{
-		TemplateARN: templateARNPrefix + gatewayTemplate,
-		Parameters:  map[string]string{"MacAddress": testMAC, "Secret": "supersecret", "SerialNumber": "38182B8456F4"},
-	})
-	if err != nil || resp.AllowProvisioning {
-		t.Errorf("expected a rejection, got %+v, %v", resp, err)
-	}
-}
-
 func TestTemplateNameFromARN(t *testing.T) {
 	tests := map[string]string{
 		templateARNPrefix + vaktusTemplate:                         vaktusTemplate,
@@ -504,11 +463,11 @@ func TestTemplateNameFromARN(t *testing.T) {
 }
 
 func TestLoadTemplates(t *testing.T) {
-	got, err := loadTemplates(`{"esp32-s3-fleet-template":{"product":"gateway","require_public_key":false},"esp32-ztp-vaktus-fleet-template":{"product":"vaktus","require_public_key":true}}`)
+	got, err := loadTemplates(`{"esp32-s3-fleet-template":{"product":"gateway"},"esp32-ztp-vaktus-fleet-template":{"product":"vaktus"}}`)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got[vaktusTemplate] != (TemplateProduct{Product: "vaktus", RequirePublicKey: true}) || got[gatewayTemplate].Product != "gateway" {
+	if got[vaktusTemplate] != (TemplateProduct{Product: "vaktus"}) || got[gatewayTemplate].Product != "gateway" {
 		t.Errorf("unexpected templates: %+v", got)
 	}
 

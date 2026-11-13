@@ -178,12 +178,6 @@ func (a *App) loadRecords(ctx context.Context) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	legacy := ""
-	for id, p := range a.cfg.Products {
-		if p.Legacy {
-			legacy = id
-		}
-	}
 	var out []Record
 	for _, it := range items {
 		r := Record{
@@ -192,9 +186,6 @@ func (a *App) loadRecords(ctx context.Context) ([]Record, error) {
 			Allowed:     attrB(it, "allowed"),
 			Provisioned: attrB(it, "provisioned"),
 			Canary:      attrB(it, "canary"),
-		}
-		if r.Product == "" {
-			r.Product = legacy
 		}
 		if n := attrN(it, "enrol_by"); n > 0 {
 			r.EnrolBy = time.Unix(n, 0)
@@ -689,8 +680,9 @@ func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []strin
 // Executing a plan.
 // ---------------------------------------------------------------------------
 
-// jobDocument is the job document: contract v1 fields every deployed device
-// reads, plus the v1.1 manifest fields when the plan says signed.
+// jobDocument is the job document: the contract v1 fields and, always, the
+// v1.1 signed manifest. Every image is signed-only (plan Phase 6) and refuses
+// a job without it.
 func (a *App) jobDocument(p ProductConfig, j *NewJob) (string, error) {
 	doc := map[string]any{
 		"operation":        "firmware_update",
@@ -698,11 +690,9 @@ func (a *App) jobDocument(p ProductConfig, j *NewJob) (string, error) {
 		"firmware_version": j.Release.Version.String(),
 		"download_url":     a.cfg.downloadURL(p, j.Release.Version),
 		"contract":         1,
-	}
-	if j.Signed {
-		doc["manifest"] = j.Release.Manifest
-		doc["sig"] = j.Release.Sig
-		doc["key_id"] = j.Release.KeyID
+		"manifest":         j.Release.Manifest,
+		"sig":              j.Release.Sig,
+		"key_id":           j.Release.KeyID,
 	}
 	if j.Downgrade {
 		doc["downgrade"] = true

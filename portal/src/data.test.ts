@@ -54,10 +54,9 @@ describe("registry", () => {
         provisioned: { BOOL: false },
         enrol_by: { N: "100" },
       }),
-      "gateway",
     );
     expect(r.thing).toBe("38182B8456F4");
-    expect(r.product).toBe("gateway"); // no product attribute: the legacy product
+    expect(r.product).toBe(""); // no product attribute: no product (there is no legacy product)
     expect(windowState(r, 99_000)).toBe("open");
     expect(windowState(r, 100_000)).toBe("expired");
     expect(windowState({ ...r, provisioned: true }, 0)).toBe("none");
@@ -136,12 +135,11 @@ describe("config", () => {
 describe("plain words", () => {
   it("explains a record's enrolment state", () => {
     const now = 1_800_000_000_000;
-    const rec = (item: Record<string, string | number | boolean>) => registryRecord(item, "gateway");
-    // The hand-made gateway record: enrolled, allowed=false, no product.
-    const legacy = rec({ mac_address: "28:84:85:53:14:4F", allowed: false, provisioned: true });
-    expect(legacy.legacy).toBe(true);
-    expect(enrolment(legacy, now).label).toBe("Enrolled");
-    expect(enrolment(legacy, now).tip).toContain("allowed=false here only blocks that");
+    const rec = (item: Record<string, string | number | boolean>) => registryRecord(item);
+    // The hand-made gateway record: enrolled, allowed=false.
+    const gateway = rec({ mac_address: "28:84:85:53:14:4F", product: "gateway", allowed: false, provisioned: true });
+    expect(enrolment(gateway, now).label).toBe("Enrolled");
+    expect(enrolment(gateway, now).tip).toContain("allowed=false here only blocks that");
     const open = rec({ mac_address: "AA", product: "vaktus", allowed: true, provisioned: false, enrol_by: now / 1000 + 60 });
     expect(enrolment(open, now).label).toBe("Window open");
     expect(enrolment({ ...open, enrolBy: now / 1000 - 60 }, now).label).toBe("Window expired");

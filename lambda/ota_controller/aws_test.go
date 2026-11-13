@@ -278,17 +278,19 @@ func TestReleasesAreVerified(t *testing.T) {
 func TestJobDocument(t *testing.T) {
 	a, _, _, _, _, _ := testApp()
 	r := rel("0.9.2")
-	unsigned, _ := a.jobDocument(vaktus, &NewJob{Release: r})
-	signed, _ := a.jobDocument(vaktus, &NewJob{Release: r, Signed: true, Downgrade: true})
-	var u, s map[string]any
-	_ = json.Unmarshal([]byte(unsigned), &u)
-	_ = json.Unmarshal([]byte(signed), &s)
+	plain, _ := a.jobDocument(vaktus, &NewJob{Release: r})
+	down, _ := a.jobDocument(vaktus, &NewJob{Release: r, Downgrade: true})
+	var u, d map[string]any
+	_ = json.Unmarshal([]byte(plain), &u)
+	_ = json.Unmarshal([]byte(down), &d)
+	// Every document is signed: the images refuse anything else.
 	if u["operation"] != "firmware_update" || u["product"] != "vaktus" || u["firmware_version"] != "0.9.2" ||
-		u["download_url"] != "https://d111.cloudfront.net/vaktus/0.9.2/app.bin" || u["manifest"] != nil || u["downgrade"] != nil {
-		t.Errorf("unsigned %s", unsigned)
+		u["download_url"] != "https://d111.cloudfront.net/vaktus/0.9.2/app.bin" || u["downgrade"] != nil ||
+		u["manifest"] != r.Manifest || u["sig"] != r.Sig || u["key_id"] != "vaktus-a" {
+		t.Errorf("job document %s", plain)
 	}
-	if s["manifest"] != r.Manifest || s["sig"] != r.Sig || s["key_id"] != "vaktus-a" || s["downgrade"] != true {
-		t.Errorf("signed %s", signed)
+	if d["downgrade"] != true || d["manifest"] != r.Manifest {
+		t.Errorf("downgrade %s", down)
 	}
 	in, _ := a.createJobInput(vaktus, &NewJob{ID: JobID{Product: "vaktus", Version: r.Version, Kind: KindFleet}, Release: r, Continuous: true})
 	if in.TargetSelection != iottypes.TargetSelectionContinuous || in.JobExecutionsRolloutConfig == nil || in.PresignedUrlConfig != nil {

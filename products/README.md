@@ -19,8 +19,6 @@ empty).
 | `soak_hours` | no, 6 | Hours a release runs on the canaries before the fleet job (0–168) |
 | `shadow_name` | no, the id | The product's named shadow, where the portal owner may set desired state; never `platform` |
 | `display_name` | no | The portal name; default the repository name without a trailing `-rust` |
-| `require_public_key` | no, false | The hook accepts only the registry record's public key (a secure element); new products enrol with a CSR either way |
-| `legacy` | no, false | Owned the platform before products existed (the gateway only) |
 | `*_name` | no | Pinned resource names; only the gateway uses them, so nothing live is renamed |
 
 Keys ending in `_reason` (or `_comment`) are notes for people and ignored.

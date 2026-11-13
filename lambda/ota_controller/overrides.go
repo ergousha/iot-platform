@@ -160,7 +160,7 @@ func planOverride(s *Snapshot, o Override) (Plan, error) {
 		}
 		pl.create(NewJob{
 			ID: id, Release: *r, Targets: []string{s.ThingARN(o.Thing)},
-			Signed: pl.signedFor(r, []string{o.Thing}), Downgrade: r.Version.Less(fv),
+			Downgrade: r.Version.Less(fv),
 		})
 
 	default:
