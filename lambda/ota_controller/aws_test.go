@@ -113,6 +113,29 @@ type fakeIoT struct {
 	targets []string // claim policy target ARNs
 	calls   []string
 	nextID  int
+	// execs: job id -> thing -> status (and reason, for failures).
+	execs  map[string]map[string][2]string
+	listed []string // jobs whose executions were listed
+}
+
+func (f *fakeIoT) ListJobExecutionsForJob(_ context.Context, in *iot.ListJobExecutionsForJobInput, _ ...func(*iot.Options)) (*iot.ListJobExecutionsForJobOutput, error) {
+	id := aws.ToString(in.JobId)
+	f.listed = append(f.listed, id)
+	out := &iot.ListJobExecutionsForJobOutput{}
+	for thing, st := range f.execs[id] {
+		out.ExecutionSummaries = append(out.ExecutionSummaries, iottypes.JobExecutionSummaryForJob{
+			ThingArn:            aws.String("arn:aws:iot:eu-central-1:1:thing/" + thing),
+			JobExecutionSummary: &iottypes.JobExecutionSummary{Status: iottypes.JobExecutionStatus(st[0])},
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeIoT) DescribeJobExecution(_ context.Context, in *iot.DescribeJobExecutionInput, _ ...func(*iot.Options)) (*iot.DescribeJobExecutionOutput, error) {
+	st := f.execs[aws.ToString(in.JobId)][aws.ToString(in.ThingName)]
+	return &iot.DescribeJobExecutionOutput{Execution: &iottypes.JobExecution{
+		StatusDetails: &iottypes.JobExecutionStatusDetails{DetailsMap: map[string]string{"reason": st[1]}},
+	}}, nil
 }
 
 func certARN(id string) string { return "arn:aws:iot:eu-central-1:111122223333:cert/" + id }
@@ -295,6 +318,29 @@ func TestJobDocument(t *testing.T) {
 	in, _ := a.createJobInput(vaktus, &NewJob{ID: JobID{Product: "vaktus", Version: r.Version, Kind: KindFleet}, Release: r, Continuous: true})
 	if in.TargetSelection != iottypes.TargetSelectionContinuous || in.JobExecutionsRolloutConfig == nil || in.PresignedUrlConfig != nil {
 		t.Errorf("fleet job input %+v", in)
+	}
+}
+
+// The planner sees a fleet device's download retry: the newest target job of
+// each thing at the fleet version, finished or not.
+func TestLoadExecutionsIncludesTheNewestRetry(t *testing.T) {
+	a, _, _, iotf, _, _ := testApp()
+	iotf.execs = map[string]map[string][2]string{
+		"ota-vaktus-0_9_1-f":       {"C1": {"FAILED", "download"}},
+		"ota-vaktus-0_9_1-t-C1-r1": {"C1": {"SUCCEEDED", ""}},
+	}
+	s := fixture()
+	s.Jobs[0].Execs = nil
+	addJob(s, "ota-vaktus-0_9_1-t-C1", JobCompleted, t0)
+	addJob(s, "ota-vaktus-0_9_1-t-C1-r1", JobCompleted, t0)
+	addJob(s, "ota-vaktus-0_9_0-t-C1", JobCompleted, t0) // another version
+	addJob(s, "ota-vaktus-0_9_0-c", JobCompleted, t0)    // a canary below the fleet version
+	if err := a.loadExecutions(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "listed", iotf.listed, []string{"ota-vaktus-0_9_1-f", "ota-vaktus-0_9_1-t-C1-r1"})
+	if e := s.Jobs[0].Execs; len(e) != 1 || e[0].failureReason() != "download" {
+		t.Errorf("fleet execs %+v", e)
 	}
 }
 

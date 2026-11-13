@@ -6,7 +6,7 @@
 #   scripts/ota.sh hold     <product>           canary and soak, but email instead of promoting
 #   scripts/ota.sh resume   <product>           back to auto
 #   scripts/ota.sh freeze   <product>           the controller leaves the product alone
-#   scripts/ota.sh rerun    <product> [X.Y.Z]   run the canary again (clears that version's halt)
+#   scripts/ota.sh rerun    <product> [X.Y.Z]   run the canary (a halted fleet version: the fleet job) again, clearing the halt
 #   scripts/ota.sh rollback <product> X.Y.Z     downgrade the fleet to a verified version (then on hold)
 #   scripts/ota.sh target   <product> <thing> [X.Y.Z]   one device: back from excluded, own job
 #   scripts/ota.sh quarantine   <product> <thing>   cut one device off (deny-all group)

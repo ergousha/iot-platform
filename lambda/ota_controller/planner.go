@@ -13,6 +13,9 @@ const (
 	queuedLimit = 2 * time.Hour
 	// canaryLifetime: a canary job with no success after this is cancelled.
 	canaryLifetime = 48 * time.Hour
+	// maxDownloadRetries: jobs of its own a fleet device gets after failing
+	// to download the fleet version, before the failure counts.
+	maxDownloadRetries = 3
 )
 
 // ActionKind is what the executor does for one Action.
@@ -378,6 +381,9 @@ func (pl *planner) watchFleet() {
 	var failed []Exec
 	succeeded, pending := 0, 0
 	for _, e := range fj.Execs {
+		if e.failed() && e.failureReason() == "download" && !pl.s.Excluded[e.Thing] {
+			e = pl.retryDownload(fj, e)
+		}
 		switch {
 		case e.failed():
 			failed = append(failed, e)
@@ -421,6 +427,57 @@ func (pl *planner) watchFleet() {
 		pl.notifyOnce("done:"+fv.String(), fmt.Sprintf("fleet on %s", fv),
 			fmt.Sprintf("Every device of %s reported %s (%d executions of %s).", pl.s.Product.ID, fv, succeeded, fj.RawID))
 	}
+}
+
+// retryDownload answers for a fleet execution that failed to download:
+// that is the device's network (it was offline, or came back on a link
+// that was not ready yet), not the release. The device gets the version
+// again in a job of its own, which waits QUEUED while it is offline, up to
+// maxDownloadRetries times per fleet job; one per tick. It returns the
+// execution that now stands for the device: the retry's, or the failure once
+// retries are spent.
+func (pl *planner) retryDownload(fj *Job, failed Exec) Exec {
+	v := fj.ID.Version
+	var latest *Job
+	retries := 0
+	for _, j := range pl.s.Jobs {
+		if j.ID.Legacy || j.ID.Kind != KindTarget || j.ID.Version != v || j.ID.Thing != failed.Thing ||
+			j.CreatedAt.Before(fj.CreatedAt) {
+			continue
+		}
+		retries++
+		if latest == nil || latest.ID.Rerun < j.ID.Rerun {
+			latest = j
+		}
+	}
+	if latest != nil {
+		for _, e := range latest.Execs {
+			if e.Thing != failed.Thing {
+				continue
+			}
+			if !e.failed() || e.failureReason() != "download" {
+				return e // succeeded, pending, cancelled or a terminal failure
+			}
+			failed = e
+		}
+		if latest.active() && len(latest.Execs) == 0 {
+			return Exec{Thing: failed.Thing, Status: ExecQueued} // created, not listed yet
+		}
+	}
+	r := pl.release(v)
+	if retries >= maxDownloadRetries || r == nil {
+		return failed
+	}
+	id := nextFree(JobID{Product: pl.s.Product.ID, Version: v, Kind: KindTarget, Thing: failed.Thing}, pl.used)
+	if !id.Valid() {
+		return failed
+	}
+	pl.create(NewJob{ID: id, Release: *r, Targets: []string{pl.s.ThingARN(failed.Thing)}})
+	pl.logf("%s could not download %s; retrying with %s", failed.Thing, v, id)
+	pl.notifyOnce("retry:"+v.String()+":"+failed.Thing, fmt.Sprintf("%s retries %s", failed.Thing, v),
+		fmt.Sprintf("%s could not download %s. It gets the update again in a job of its own (%s), "+
+			"which waits while it is offline; at most %d times.", failed.Thing, v, id, maxDownloadRetries))
+	return Exec{Thing: failed.Thing, Status: ExecQueued}
 }
 
 // advance moves the desired release through canary, soak and promotion.
