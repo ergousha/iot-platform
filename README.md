@@ -149,7 +149,7 @@ To **re-enrol** a device (a new key, erased NVS), use `ergo commission --reprovi
 
 ## 3. Firmware Release & OTA Flow
 
-Releases are fully automated. A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub pre-release and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
+Releases are fully automated. A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub release (not marked Latest; its GitHub status does not affect the rollout) and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
 
 ### What a release uploads
 
@@ -222,7 +222,7 @@ The claim certificate is no longer in Terraform. The controller:
 * keeps it ACTIVE only while a registry record has an open window (`allowed`, not `provisioned`, `enrol_by` in the future) and the guard is clear. `ergo commission` arms and disarms bench windows itself; site windows (`ergo register --minutes`, up to a week) are armed by the tick;
 * rotates it after a site window, when asked (`scripts/ota.sh rotate-claim`), and whenever SSM and the claim policy disagree: a P-256 key generated in memory, `CreateCertificateFromCsr`, the claim policy attached, `/iot-platform/claim/{cert,key}` (SecureString) written, the old certificate deactivated and deleted;
 * hourly, deletes certificates attached to no thing for over a day, and deactivates the older certificate of a re-enrolled thing once presence shows it connecting with the new one;
-* hourly, emails about a GitHub pre-release over an hour old whose manifest never reached S3.
+* hourly, emails about a GitHub release of the workflow (it carries `manifest.sig`) over an hour old whose manifest never reached S3.
 
 ---
 

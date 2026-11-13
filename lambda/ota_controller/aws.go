@@ -625,11 +625,12 @@ func (a *App) keyring(ctx context.Context, product string) (Keyring, error) {
 	return ParseKeyring(aws.ToString(out.Parameter.Value))
 }
 
-// orphans are GitHub pre-releases of the release workflow (they carry a
+// orphans are GitHub releases of the release workflow (they carry a
 // manifest.sig asset, uploaded before S3) above the fleet version, older than
 // an hour, whose manifest never reached S3 (a publish that failed after the
-// tag). Pre-releases from before the workflow carry no manifest.sig and are
-// not reported. Best effort: the unauthenticated API is rate limited, and
+// tag). Full releases and the pre-releases of older workflows alike: the
+// GitHub status means nothing to the rollout. Releases from before the
+// workflow carry no manifest.sig and are not reported. Best effort: the unauthenticated API is rate limited, and
 // errors are only logged.
 func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []string {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
@@ -647,11 +648,10 @@ func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []strin
 		return nil
 	}
 	var rels []struct {
-		Tag        string    `json:"tag_name"`
-		Draft      bool      `json:"draft"`
-		Prerelease bool      `json:"prerelease"`
-		CreatedAt  time.Time `json:"created_at"`
-		Assets     []struct {
+		Tag       string    `json:"tag_name"`
+		Draft     bool      `json:"draft"`
+		CreatedAt time.Time `json:"created_at"`
+		Assets    []struct {
 			Name string `json:"name"`
 		} `json:"assets"`
 	}
@@ -669,7 +669,7 @@ func (a *App) orphans(ctx context.Context, p ProductConfig, s *Snapshot) []strin
 	var out []string
 	for _, r := range rels {
 		v, err := ParseVersion(r.Tag)
-		if err != nil || r.Draft || !r.Prerelease || s.Now.Sub(r.CreatedAt) < time.Hour ||
+		if err != nil || r.Draft || s.Now.Sub(r.CreatedAt) < time.Hour ||
 			!s.State.FleetVersion.Less(v) || known[v.String()] {
 			continue
 		}
