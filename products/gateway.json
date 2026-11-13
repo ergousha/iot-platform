@@ -2,7 +2,6 @@
   "description": "OPC UA gateway (Waveshare ESP32-S3-ETH)",
   "github_repository": "ergousha/esp32-opcua-gateway-rust",
   "github_repository_id": 1302001123,
-  "legacy": true,
   "shadow_name": "opcua",
   "fleet_group_name": "esp32-ztp-fleet",
   "canary_group_name": "esp32-ztp-canary",

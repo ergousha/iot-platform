@@ -74,7 +74,7 @@ locals {
     "object-src 'none'",
   ])
 
-  # The registry attributes the portal may read: everything but `secret`.
+  # The registry attributes the portal may read (an allow-list).
   portal_registry_attributes = [
     "mac_address", "product", "allowed", "provisioned", "enrol_by", "canary", "public_key",
     "last_provisioned_serial", "last_certificate_id", "last_provisioned_via", "last_provisioned_at",
@@ -625,8 +625,7 @@ data "aws_iam_policy_document" "portal_read" {
     resources = [aws_dynamodb_table.presence.arn]
   }
 
-  # The registry, without the gateway's shared secret: only scans that
-  # project the listed attributes are allowed.
+  # The registry: only scans that project the listed attributes are allowed.
   statement {
     sid       = "Registry"
     actions   = ["dynamodb:Scan"]
@@ -762,7 +761,6 @@ resource "aws_s3_object" "portal_config" {
       name        = p.display_name
       description = p.description
       shadow      = p.shadow_name
-      legacy      = p.legacy
     }]
   })
 

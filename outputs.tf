@@ -4,7 +4,7 @@ output "iot_endpoint" {
 }
 
 output "provisioning_template_names" {
-  description = "Provisioning template of each product (also in SSM at /esp32-ztp/poc/<product>/provisioning_template_name)."
+  description = "Provisioning template of each product (also in SSM at /iot-platform/products/<product>/platform)."
   value       = { for id, t in aws_iot_provisioning_template.fleet : id => t.name }
 }
 

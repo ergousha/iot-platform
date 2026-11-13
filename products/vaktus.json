@@ -2,7 +2,6 @@
   "description": "Vaktu's-Salat prayer-times display (ESP32 + ATECC608B)",
   "github_repository": "ergousha/esp32-display-vaktus-salat-rust",
   "github_repository_id": 1290322529,
-  "require_public_key": true,
   "soak_hours": 24,
   "soak_hours_reason": "Prayer-time boundary bugs matter more than speed."
 }

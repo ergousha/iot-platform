@@ -33,7 +33,6 @@ type NewJob struct {
 	Release    Release
 	Targets    []string // ARNs
 	Continuous bool
-	Signed     bool // carry the manifest, signature and key id
 	Downgrade  bool
 }
 
@@ -66,7 +65,7 @@ func (p Plan) String() string {
 	for _, a := range p.Actions {
 		switch a.Kind {
 		case ActCreateJob:
-			fmt.Fprintf(&b, "create %s signed=%t downgrade=%t; ", a.Job.ID, a.Job.Signed, a.Job.Downgrade)
+			fmt.Fprintf(&b, "create %s downgrade=%t; ", a.Job.ID, a.Job.Downgrade)
 		case ActCancelJob:
 			fmt.Fprintf(&b, "cancel %s; ", a.JobID)
 		case ActCancelExecution:
@@ -192,24 +191,6 @@ func (pl *planner) release(v Version) *Release {
 		}
 	}
 	return nil
-}
-
-// signedFor reports whether every device in things accepts the release's
-// signing key (its platform shadow lists the key id). Units running firmware
-// without that key would refuse a signed job (reason sig), so they get the
-// v1 document until every unit has the key; the controller has verified the
-// signature either way. A `signed-only` mode ends the transition.
-func (pl *planner) signedFor(r *Release, things []string) bool {
-	if len(things) == 0 {
-		return false
-	}
-	for _, t := range things {
-		d := pl.s.Fleet[t]
-		if d == nil || d.Shadow == nil || !contains(d.Shadow.KeyIDs, r.KeyID) {
-			return false
-		}
-	}
-	return true
 }
 
 func contains(list []string, s string) bool {
@@ -483,7 +464,6 @@ func (pl *planner) startCanary(d *Release, rerun int) {
 	id := nextFree(JobID{Product: pl.s.Product.ID, Version: d.Version, Kind: KindCanary, Rerun: rerun}, pl.used)
 	pl.create(NewJob{
 		ID: id, Release: *d, Targets: []string{pl.s.Product.Canary.ARN},
-		Signed: pl.signedFor(d, pl.canaryThings()),
 	})
 	pl.logf("created canary job %s", id)
 }
@@ -633,7 +613,7 @@ func (pl *planner) rollOut(r *Release, downgrade bool) {
 		id := nextFree(JobID{Product: pl.s.Product.ID, Version: r.Version, Kind: KindFleet}, pl.used)
 		pl.create(NewJob{
 			ID: id, Release: *r, Targets: []string{pl.s.Product.Fleet.ARN}, Continuous: true,
-			Signed: pl.signedFor(r, pl.fleetThings()), Downgrade: downgrade,
+			Downgrade: downgrade,
 		})
 		pl.logf("created fleet job %s", id)
 		fj = nil

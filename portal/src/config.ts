@@ -9,7 +9,6 @@ export interface ProductConfig {
   canary: string;
   excluded: string;
   shadow: string; // the product's named shadow
-  legacy?: boolean; // owns registry records without a product attribute
 }
 
 export interface Config {

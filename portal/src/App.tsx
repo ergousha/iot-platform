@@ -33,11 +33,10 @@ async function settle<T>(p: Promise<T>): Promise<T | Error> {
 }
 
 async function loadOverview(c: Clients): Promise<Overview> {
-  const legacy = c.cfg.products.find((p) => p.legacy)?.id ?? "";
   const [statuses, pres, reg, quarantined] = await Promise.all([
     Promise.all(c.cfg.products.map(async (p) => [p.id, await settle(productStatus(c, p.id))] as const)),
     settle(scanPresence(c).then(presence)),
-    settle(scanRegistry(c).then((items) => items.map((i) => registryRecord(i, legacy)))),
+    settle(scanRegistry(c).then((items) => items.map((i) => registryRecord(i)))),
     settle(groupThings(c, c.cfg.quarantineGroup).then((t) => new Set(t))),
   ]);
   return { statuses: Object.fromEntries(statuses), presence: pres, registry: reg, quarantined, loadedAt: new Date() };

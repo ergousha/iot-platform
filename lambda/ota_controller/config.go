@@ -31,8 +31,6 @@ type ProductConfig struct {
 	Repository string
 	// SoakHours is the default soak; the fleet attribute soak_hours wins.
 	SoakHours int
-	// Legacy: registry records without a product attribute are this product's.
-	Legacy bool
 }
 
 // Config is the Lambda's environment. Terraform holds every default; a
@@ -90,7 +88,6 @@ type productJSON struct {
 	ExcludedGroupARN string `json:"excluded_group_arn"`
 	Repository       string `json:"repository"`
 	SoakHours        int    `json:"soak_hours"`
-	Legacy           bool   `json:"legacy"`
 }
 
 type envParser struct {
@@ -195,7 +192,6 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			p.errs = append(p.errs, errors.New("PRODUCTS must be a non-empty JSON object"))
 		}
 		c.Products = map[string]ProductConfig{}
-		legacy := 0
 		for id, pj := range products {
 			fleet, ok1 := groupFromARN(pj.FleetGroupARN)
 			canary, ok2 := groupFromARN(pj.CanaryGroupARN)
@@ -210,16 +206,10 @@ func loadConfig(getenv func(string) string) (Config, error) {
 			case pj.SoakHours < 0 || pj.SoakHours > 168:
 				p.errs = append(p.errs, fmt.Errorf("PRODUCTS[%s]: soak_hours must be 0-168", id))
 			}
-			if pj.Legacy {
-				legacy++
-			}
 			c.Products[id] = ProductConfig{
 				ID: id, Fleet: fleet, Canary: canary, Excluded: excluded,
-				Repository: pj.Repository, SoakHours: pj.SoakHours, Legacy: pj.Legacy,
+				Repository: pj.Repository, SoakHours: pj.SoakHours,
 			}
-		}
-		if legacy > 1 {
-			p.errs = append(p.errs, errors.New("PRODUCTS: at most one product may be legacy"))
 		}
 	}
 	return c, errors.Join(p.errs...)

@@ -19,7 +19,7 @@ locals {
   # (terraform_data.products).
   product_fields = [
     "description", "github_repository", "github_repository_id", "soak_hours", "shadow_name",
-    "display_name", "require_public_key", "legacy", "fleet_group_name", "canary_group_name",
+    "display_name", "fleet_group_name", "canary_group_name",
     "excluded_group_name", "provisioning_template_name", "github_actions_role_name",
   ]
 
@@ -31,8 +31,6 @@ locals {
       github_repository    = p.github_repository
       github_repository_id = p.github_repository_id
       soak_hours           = try(p.soak_hours, 6)
-      require_public_key   = try(p.require_public_key, false)
-      legacy               = try(p.legacy, false)
 
       fleet_group_name           = coalesce(try(p.fleet_group_name, null), "${var.project_name}-${id}-fleet")
       canary_group_name          = coalesce(try(p.canary_group_name, null), "${var.project_name}-${id}-canary")
@@ -48,9 +46,6 @@ locals {
   # The state bucket of versions.tf's backend (backend blocks take no
   # expressions). Products' cloud/ roots keep their state there too.
   state_bucket = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}"
-
-  # The product marked `legacy`, or null.
-  legacy_product = one([for id, p in local.products : id if p.legacy])
 
   # The provisioning template ARNs, built as strings rather than read from the
   # template resources. This lets the hook's Lambda permission be created
@@ -98,10 +93,6 @@ resource "terraform_data" "products" {
     precondition {
       condition     = alltrue([for p in values(local.products) : can(regex("^[A-Za-z0-9_-]{1,64}$", p.shadow_name)) && p.shadow_name != "platform"])
       error_message = "shadow_name is a shadow name (letters, digits, _ and -) and never `platform`, the shadow only devices write."
-    }
-    precondition {
-      condition     = length([for p in values(local.products) : p if p.legacy]) <= 1
-      error_message = "At most one product may set legacy."
     }
     precondition {
       condition     = length(distinct([for p in values(local.products) : p.github_repository])) == length(local.products)

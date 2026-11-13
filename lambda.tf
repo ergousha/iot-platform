@@ -39,17 +39,13 @@ resource "aws_lambda_function" "pre_provisioning_hook" {
   environment {
     variables = {
       DEVICE_TABLE = aws_dynamodb_table.device_registry.name
-      # Which product each template enrols, and whether that product must prove
-      # itself with a registered public key. See lambda/pre_provisioning_hook.
+      # Which product each template enrols. Every product proves itself with
+      # its registered public key. See lambda/pre_provisioning_hook.
       PRODUCTS_BY_TEMPLATE = jsonencode({
         for id, p in local.products : p.provisioning_template_name => {
-          product            = id
-          require_public_key = p.require_public_key
+          product = id
         }
       })
-      # Registry records written before products existed carry no `product`
-      # attribute; they belong to the legacy product ("" = none: rejected).
-      LEGACY_RECORD_PRODUCT = local.legacy_product == null ? "" : local.legacy_product
     }
   }
 
@@ -59,12 +55,11 @@ resource "aws_lambda_function" "pre_provisioning_hook" {
 # Lets AWS IoT invoke the hook, once per provisioning template. source_arn
 # comes from a string local rather than the template resources: referencing
 # them would be a cycle, and this way the permission exists before the
-# template that needs it. The legacy product keeps the statement id it had
-# before products existed, so its permission is updated in place, never removed.
+# template that needs it.
 resource "aws_lambda_permission" "allow_iot" {
   for_each = local.products
 
-  statement_id  = each.value.legacy ? "AllowIoTFleetProvisioningInvoke" : "AllowIoTFleetProvisioningInvoke-${each.key}"
+  statement_id  = "AllowIoTFleetProvisioningInvoke-${each.key}"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.pre_provisioning_hook.function_name
   principal     = "iot.amazonaws.com"

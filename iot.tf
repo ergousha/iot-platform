@@ -3,12 +3,12 @@
 # ===========================================================================
 
 locals {
-  # Both certificate APIs: CreateKeysAndCertificate (AWS generates the key; the
-  # gateway) and CreateCertificateFromCsr (the key stays in the device's secure
-  # element; Vaktus). Which one a product may effectively use is enforced by the
-  # pre-provisioning hook, not here: the claim certificate is shared.
+  # CreateCertificateFromCsr only: every product's key stays on the device (a
+  # secure element or NVS), and the hook enrols only the registered key.
+  # CreateKeysAndCertificate ($aws/certificates/create/*), where AWS generated
+  # the key, is not reachable.
   claim_topics = concat(
-    ["$aws/certificates/create/*", "$aws/certificates/create-from-csr/*"],
+    ["$aws/certificates/create-from-csr/*"],
     [for p in values(local.products) : "$aws/provisioning-templates/${p.provisioning_template_name}/provision/*"],
   )
 }
@@ -57,7 +57,7 @@ resource "aws_iot_policy" "claim" {
         Resource = "arn:aws:iot:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:client/claim-*"
       },
       {
-        Sid      = "CreateKeysAndCertificate"
+        Sid      = "Provision"
         Effect   = "Allow"
         Action   = ["iot:Publish", "iot:Receive"]
         Resource = [for t in local.claim_topics : "${local.iot_arn}:topic/${t}"]
@@ -94,9 +94,18 @@ locals {
   # Ingest (`$aws/rules/<product>_*`): no messaging charge, and no other
   # product's rules. A thing without the attribute matches nothing.
   product = "$${iot:Connection.Thing.Attributes[product]}"
+
+  # The device's own Jobs and named-shadow topics. In a policy resource `*`
+  # matches any characters, `/` included; MQTT wildcards are literal.
+  jobs   = "$aws/things/${local.thing}/jobs"
+  shadow = "$aws/things/${local.thing}/shadow/name/*"
 }
 
 locals {
+  # Request topics and the answers the firmware acts on, nothing more
+  # (PLATFORM.md §6). In particular no shadow `update/accepted` or
+  # `update/documents`: each would echo every report back to the device and
+  # double its messaging.
   device_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -117,10 +126,12 @@ locals {
         Action = "iot:Publish"
         Resource = [
           "${local.iot_arn}:topic/${var.telemetry_topic_prefix}/${local.thing}/*",
-          "${local.iot_arn}:topic/$aws/things/${local.thing}/jobs/*",
-          # The OPC UA config plane lives on the `opcua` NAMED shadow, so this
-          # has to cover `shadow/name/<name>/...`, not just the classic shadow.
-          "${local.iot_arn}:topic/$aws/things/${local.thing}/shadow/*",
+          # DescribeJobExecution ($next or a job id) and UpdateJobExecution.
+          "${local.iot_arn}:topic/${local.jobs}/*/get",
+          "${local.iot_arn}:topic/${local.jobs}/*/update",
+          # Named shadows only: `platform` and the product's.
+          "${local.iot_arn}:topic/${local.shadow}/get",
+          "${local.iot_arn}:topic/${local.shadow}/update",
           "${local.iot_arn}:topic/$aws/rules/${local.product}_*",
         ]
       },
@@ -129,19 +140,26 @@ locals {
         Effect = "Allow"
         Action = "iot:Subscribe"
         Resource = [
+          # The gateway's retained OPC UA tag bundle.
           "${local.iot_arn}:topicfilter/cmd/${local.thing}/*",
-          "${local.iot_arn}:topicfilter/$aws/things/${local.thing}/jobs/*",
-          "${local.iot_arn}:topicfilter/$aws/things/${local.thing}/shadow/*",
+          "${local.iot_arn}:topicfilter/${local.jobs}/notify-next",
+          "${local.iot_arn}:topicfilter/${local.jobs}/*/accepted",
+          "${local.iot_arn}:topicfilter/${local.jobs}/*/rejected",
+          "${local.iot_arn}:topicfilter/${local.shadow}/get/*",
+          "${local.iot_arn}:topicfilter/${local.shadow}/update/delta",
+          "${local.iot_arn}:topicfilter/${local.shadow}/update/rejected",
         ]
       },
       {
+        # Receive applies only to messages of a subscription the statement
+        # above allowed, so it may stay broad: listing every topic again would
+        # not fit the 2048-character limit.
         Sid    = "Receive"
         Effect = "Allow"
         Action = "iot:Receive"
         Resource = [
           "${local.iot_arn}:topic/cmd/${local.thing}/*",
-          "${local.iot_arn}:topic/$aws/things/${local.thing}/jobs/*",
-          "${local.iot_arn}:topic/$aws/things/${local.thing}/shadow/*",
+          "${local.iot_arn}:topic/$aws/things/${local.thing}/*",
         ]
       },
     ]
@@ -243,12 +261,8 @@ resource "aws_iot_provisioning_template" "fleet" {
 
   template_body = jsonencode({
     Parameters = {
-      SerialNumber = { Type = "String" }
-      MacAddress   = { Type = "String" }
-      # Secret goes to the hook but is not used in the thing resource. Products
-      # that enrol with a secure element prove themselves with their key
-      # instead and may leave it out.
-      Secret                      = { Type = "String", Default = "" }
+      SerialNumber                = { Type = "String" }
+      MacAddress                  = { Type = "String" }
       "AWS::IoT::Certificate::Id" = { Type = "String" }
     }
 

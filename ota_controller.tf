@@ -264,7 +264,6 @@ resource "aws_lambda_function" "ota_controller" {
           excluded_group_arn = aws_iot_thing_group.excluded[id].arn
           repository         = p.github_repository
           soak_hours         = p.soak_hours
-          legacy             = p.legacy
         }
       })
       REGISTRY_TABLE                   = aws_dynamodb_table.device_registry.name

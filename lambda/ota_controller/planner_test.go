@@ -114,24 +114,14 @@ func TestIdleFleetDoesNothing(t *testing.T) {
 	}
 }
 
-func TestNewReleaseStartsASignedCanaryJob(t *testing.T) {
+func TestNewReleaseStartsACanaryJob(t *testing.T) {
 	s := fixture()
 	s.Releases = append(s.Releases, rel("0.9.2"))
 	p := planTick(s)
 	eq(t, "created", created(p), []string{"ota-vaktus-0_9_2-c"})
 	j := kinds(p, ActCreateJob)[0].Job
-	if !j.Signed || j.Continuous || j.Downgrade || j.Targets[0] != vaktus.Canary.ARN {
+	if j.Continuous || j.Downgrade || j.Targets[0] != vaktus.Canary.ARN {
 		t.Errorf("canary job %+v", j)
-	}
-}
-
-func TestCanaryWithoutTheKeyGetsAnUnsignedJob(t *testing.T) {
-	s := fixture()
-	s.Releases = append(s.Releases, rel("0.9.2"))
-	s.Fleet["C1"].Shadow.KeyIDs = nil // older firmware: empty keyring
-	j := kinds(planTick(s), ActCreateJob)[0].Job
-	if j.Signed {
-		t.Error("a canary without the key would refuse a signed job (reason sig)")
 	}
 }
 
@@ -148,7 +138,7 @@ func TestSoakedCanaryIsPromoted(t *testing.T) {
 	eq(t, "created", created(p), []string{"ota-vaktus-0_9_2-f"})
 	eq(t, "cancelled", cancelled(p), []string{"ota-vaktus-0_9_1-f"})
 	j := kinds(p, ActCreateJob)[0].Job
-	if !j.Continuous || j.Targets[0] != vaktus.Fleet.ARN || !j.Signed {
+	if !j.Continuous || j.Targets[0] != vaktus.Fleet.ARN {
 		t.Errorf("fleet job %+v", j)
 	}
 	if p.State.FleetVersion != ver("0.9.2") {

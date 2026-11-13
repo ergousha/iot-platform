@@ -36,7 +36,6 @@ export function Enrolment() {
     .sort((a, b) => (b.r.enrolBy ?? Number.MAX_SAFE_INTEGER) - (a.r.enrolBy ?? Number.MAX_SAFE_INTEGER));
   const open = pending.filter(({ w }) => w === "open").length;
   const enrolled = registry.filter((r) => r.provisioned).length;
-  const legacyName = productName(cfg.products.find((p) => p.legacy));
 
   const rotatedAt = typeof claim?.rotated_at === "string" ? claim.rotated_at : undefined;
   const rotatePending = claim?.rotate_pending === true;
@@ -155,7 +154,7 @@ export function Enrolment() {
                   <Th tip="Enrolled: the device has its own certificate. Window open: it may enrol now. Hover a status for details.">
                     Status
                   </Th>
-                  <Th tip="How the device proved itself when it enrolled: the key in its secure element, or the product's shared secret.">
+                  <Th tip="How the device proved itself when it enrolled: its own key, in a secure element or NVS. Records from before Phase 6 may show the retired shared secret.">
                     Enrolled with
                   </Th>
                   <Th align="end">Enrolled</Th>
@@ -166,23 +165,7 @@ export function Enrolment() {
                   <tr key={r.mac}>
                     <td className="mono cell-main">{r.mac}</td>
                     <td>
-                      <div className="pills">
-                        {productName(productById(cfg, r.product), r.product)}
-                        {r.legacy && (
-                          <Pill
-                            tip={
-                              `Written before the platform had products: it has no product attribute, so it belongs to ${legacyName}, ` +
-                              "and no enrolment history." +
-                              (r.allowed
-                                ? ""
-                                : " Its allowed=false only blocks a new enrolment; the enrolled device is unaffected.") +
-                              " ergo commission rewrites the record when the device is enrolled again."
-                            }
-                          >
-                            legacy record
-                          </Pill>
-                        )}
-                      </div>
+                      {r.product ? productName(productById(cfg, r.product), r.product) : <span className="muted">none</span>}
                     </td>
                     <td>
                       <BadgePill badge={enrolment(r, now)} />
