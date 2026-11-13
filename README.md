@@ -174,7 +174,7 @@ It runs every 15 minutes (the source of truth), on the S3 event of each `manifes
 | Halt | A FAILED or REJECTED canary execution sets `halted_version` and cancels the job. Exception: reason `download` gets one rerun (`-c-r1`). |
 | Soak gate | Every canary succeeded, is online, and its `platform` shadow, reported after the update, shows the new `fw` with `boot_count_since_update == 1`. A crash `boot_reason` (panic, watchdogs) halts. A reconnect restarts the soak; a non-crash reboot blocks it (one email; `promote` overrides). Soak: `soak_hours` (6 h; vaktus 24 h). |
 | Promote | `auto`: a CONTINUOUS fleet job `ota-<p>-<X_Y_Z>-f`, `fleet_version` set, and only then the previous fleet job cancelled. `hold`: one "ready to promote" email. |
-| Fleet failures | One failed device while others succeed: moved to the excluded group, email. Two or more: the fleet job is cancelled and the version halted. |
+| Fleet failures | A `download` failure is the device's network, not the release (it was offline at the release, or its link was not ready): the device gets the version again in a job of its own, `ota-<p>-<X_Y_Z>-t-<thing>[-rN]`, which waits while it is offline; up to 3 per fleet job, one email. Otherwise, or once those are spent: one failed device while others succeed is moved to the excluded group, email; the only device, or two or more, cancel the fleet job and halt the version. |
 | Done | One "fleet on X.Y.Z" email. |
 | Legacy | Jobs of the old `ota_trigger` (`ota-<p>-firmware_v…-<ms>`) are cancelled: their presigned URLs died with it. |
 
@@ -188,7 +188,7 @@ State lives in the attributes of the product's fleet group: `ota_mode` (`auto`, 
 scripts/ota.sh status   vaktus
 scripts/ota.sh promote  vaktus [X.Y.Z]      # skip the soak gate
 scripts/ota.sh hold|resume|freeze vaktus
-scripts/ota.sh rerun    vaktus [X.Y.Z]      # canary again, clears that version's halt
+scripts/ota.sh rerun    vaktus [X.Y.Z]      # canary again, clears that version's halt (a halted fleet version: its fleet job again)
 scripts/ota.sh rollback vaktus X.Y.Z        # downgrade:true fleet job; then on hold
 scripts/ota.sh target   vaktus <thing>      # back from excluded, with its own job
 scripts/ota.sh rotate-claim

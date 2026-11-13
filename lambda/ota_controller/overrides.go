@@ -98,12 +98,15 @@ func planOverride(s *Snapshot, o Override) (Plan, error) {
 		if err != nil {
 			return Plan{}, err
 		}
-		if !fv.Less(r.Version) {
+		// The fleet version itself when its fleet job was halted: roll it
+		// out again.
+		haltedFleet := r.Version == fv && r.Version == pl.state.HaltedVersion
+		if !fv.Less(r.Version) && !haltedFleet {
 			return Plan{}, fmt.Errorf("%s is not above the fleet version %s", r.Version, fv)
 		}
 		pl.clearHalt(r.Version)
 		pl.forget(r.Version)
-		if len(s.Fleet) <= 1 {
+		if len(s.Fleet) <= 1 || haltedFleet {
 			pl.rollOut(r, false)
 			break
 		}

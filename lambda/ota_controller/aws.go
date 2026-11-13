@@ -410,18 +410,27 @@ func (a *App) snapshot(ctx context.Context, p ProductConfig, g *global, opt load
 }
 
 // loadExecutions loads the executions the planner looks into: every active
-// job's and the newest canary job's of each version above the fleet's.
+// job's, the newest canary job's of each version above the fleet's, and the
+// newest target job's of each thing at the fleet version (a fleet device's
+// download retry).
 func (a *App) loadExecutions(ctx context.Context, s *Snapshot) error {
 	newestCanary := map[Version]*Job{}
+	newestTarget := map[string]*Job{}
 	for _, j := range s.Jobs {
-		if !j.ID.Legacy && j.ID.Kind == KindCanary && s.State.FleetVersion.Less(j.ID.Version) {
+		switch {
+		case j.ID.Legacy:
+		case j.ID.Kind == KindCanary && s.State.FleetVersion.Less(j.ID.Version):
 			if cur := newestCanary[j.ID.Version]; cur == nil || cur.ID.Rerun < j.ID.Rerun {
 				newestCanary[j.ID.Version] = j
+			}
+		case j.ID.Kind == KindTarget && j.ID.Version == s.State.FleetVersion:
+			if cur := newestTarget[j.ID.Thing]; cur == nil || cur.ID.Rerun < j.ID.Rerun {
+				newestTarget[j.ID.Thing] = j
 			}
 		}
 	}
 	for _, j := range s.Jobs {
-		if j.ID.Legacy || (!j.active() && newestCanary[j.ID.Version] != j) {
+		if j.ID.Legacy || (!j.active() && newestCanary[j.ID.Version] != j && newestTarget[j.ID.Thing] != j) {
 			continue
 		}
 		p := iot.NewListJobExecutionsForJobPaginator(a.iot, &iot.ListJobExecutionsForJobInput{JobId: aws.String(j.RawID), MaxResults: aws.Int32(250)})

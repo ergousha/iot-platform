@@ -387,6 +387,77 @@ func TestFleetFailures(t *testing.T) {
 	}
 }
 
+// A device that cannot download the fleet version (it was offline at the
+// release, or its link was not ready) is retried with a job of its own, not
+// halted: the one device of a single-device product included.
+func TestFleetDownloadFailureIsRetried(t *testing.T) {
+	single := func() *Snapshot {
+		s := fixture()
+		delete(s.Fleet, "F1")
+		delete(s.Fleet, "F2")
+		s.Jobs[0].Execs = []Exec{{Thing: "C1", Status: ExecFailed, Reason: "download"}}
+		s.State.Notified = nil
+		return s
+	}
+
+	s := single()
+	p := planTick(s)
+	eq(t, "created", created(p), []string{"ota-vaktus-0_9_1-t-C1"})
+	if j := kinds(p, ActCreateJob)[0].Job; j.Targets[0] != s.ThingARN("C1") || j.Continuous || j.Downgrade {
+		t.Errorf("retry job %+v", j)
+	}
+	if len(cancelled(p)) != 0 || !p.State.HaltedVersion.IsZero() || !strings.Contains(subjects(p), "C1 retries 0.9.1") {
+		t.Fatalf("first failure: %s %+v", p, p.State)
+	}
+
+	// The retry waits while the device is offline: nothing happens.
+	s.State = p.State
+	retry := addJob(s, "ota-vaktus-0_9_1-t-C1", JobInProgress, t0, Exec{Thing: "C1", Status: ExecQueued})
+	if p := planTick(s); len(p.Actions) != 0 {
+		t.Fatalf("waiting retry: %s", p)
+	}
+
+	// It succeeds: the fleet is done.
+	retry.Status, retry.Execs = JobCompleted, []Exec{{Thing: "C1", Status: ExecSucceeded}}
+	p = planTick(s)
+	if subjects(p) != "[vaktus] fleet on 0.9.1" || !p.State.HaltedVersion.IsZero() {
+		t.Fatalf("retry succeeded: %s %+v", p, p.State)
+	}
+
+	// A terminal failure of the retry halts, as it would have at once.
+	s = single()
+	addJob(s, "ota-vaktus-0_9_1-t-C1", JobCompleted, t0, Exec{Thing: "C1", Status: ExecFailed, Reason: "sig"})
+	p = planTick(s)
+	if p.State.HaltedVersion != ver("0.9.1") || p.State.HaltedReason != "fleet:C1:sig" || len(created(p)) != 0 {
+		t.Fatalf("terminal retry failure: %s %+v", p, p.State)
+	}
+
+	// Download failures again: the next retry, up to maxDownloadRetries; then the failure counts.
+	s = single()
+	addJob(s, "ota-vaktus-0_9_1-t-C1", JobCompleted, t0, Exec{Thing: "C1", Status: ExecFailed, Reason: "download"})
+	eq(t, "second retry", created(planTick(s)), []string{"ota-vaktus-0_9_1-t-C1-r1"})
+	addJob(s, "ota-vaktus-0_9_1-t-C1-r1", JobCompleted, t0, Exec{Thing: "C1", Status: ExecFailed, Reason: "download"})
+	addJob(s, "ota-vaktus-0_9_1-t-C1-r2", JobCompleted, t0, Exec{Thing: "C1", Status: ExecFailed, Reason: "download"})
+	p = planTick(s)
+	if len(created(p)) != 0 || p.State.HaltedReason != "fleet:C1:download" {
+		t.Fatalf("retries spent: %s %+v", p, p.State)
+	}
+
+	// Retries from before the current fleet job (an earlier, halted one) do not count.
+	s = single()
+	addJob(s, "ota-vaktus-0_9_1-t-C1", JobCompleted, t0.Add(-100*time.Hour), Exec{Thing: "C1", Status: ExecFailed, Reason: "download"})
+	eq(t, "fresh budget", created(planTick(s)), []string{"ota-vaktus-0_9_1-t-C1-r1"})
+
+	// Among successes, a download failure is retried, not excluded.
+	s = fixture()
+	s.Jobs[0].Execs[2] = Exec{Thing: "F2", Status: ExecFailed, Reason: "download"}
+	p = planTick(s)
+	eq(t, "fleet device retry", created(p), []string{"ota-vaktus-0_9_1-t-F2"})
+	if len(kinds(p, ActMove)) != 0 {
+		t.Fatalf("excluded instead of retried: %s", p)
+	}
+}
+
 func TestDoneIsEmailedOnce(t *testing.T) {
 	s := fixture()
 	s.State.Notified = nil
@@ -478,6 +549,23 @@ func TestOverrides(t *testing.T) {
 	eq(t, "rerun", created(p), []string{"ota-vaktus-0_9_2-c-r1"})
 	if !p.State.HaltedVersion.IsZero() || p.State.notified("halt:0.9.2") || p.State.notified("blocked:0.9.2:C1") {
 		t.Errorf("rerun state %+v", p.State)
+	}
+
+	// rerun of the fleet version whose fleet job was halted: a new fleet job.
+	s = fixture()
+	s.State.HaltedVersion, s.State.HaltedReason = ver("0.9.1"), "fleet:C1:download"
+	s.Jobs[0].Status = JobCanceled
+	p, err = planOverride(s, Override{Action: "rerun", Product: "vaktus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "rerun fleet", created(p), []string{"ota-vaktus-0_9_1-f-r1"})
+	if !p.State.HaltedVersion.IsZero() || p.State.FleetVersion != ver("0.9.1") {
+		t.Errorf("rerun fleet state %+v", p.State)
+	}
+	s.State.HaltedVersion = Version{}
+	if _, err := planOverride(s, Override{Action: "rerun", Version: "0.9.1"}); err == nil {
+		t.Error("rerun of a fleet version that is not halted")
 	}
 
 	// target: an excluded device comes back with its own job.
