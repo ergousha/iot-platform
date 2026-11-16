@@ -60,6 +60,9 @@ describe("registry", () => {
     expect(windowState(r, 99_000)).toBe("open");
     expect(windowState(r, 100_000)).toBe("expired");
     expect(windowState({ ...r, provisioned: true }, 0)).toBe("none");
+    // No enrol_by: closed, like the OTA controller (it never arms the claim).
+    expect(windowState({ ...r, enrolBy: undefined }, 0)).toBe("expired");
+    expect(windowState({ ...r, enrolBy: undefined, allowed: false }, 0)).toBe("none");
   });
 });
 

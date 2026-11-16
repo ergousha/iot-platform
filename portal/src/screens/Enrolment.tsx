@@ -102,7 +102,7 @@ export function Enrolment() {
 
         <Section
           title="Enrolment windows"
-          tip="Records allowed to enrol and not yet enrolled. A window with no end date never expires."
+          tip="Records allowed to enrol and not yet enrolled. A record with no end date has no open window: the OTA controller keeps the claim certificate off for it."
         >
           {pending.length === 0 ? (
             <Empty>
@@ -124,7 +124,7 @@ export function Enrolment() {
                     <td className="mono">{r.mac}</td>
                     <td>{productName(productById(cfg, r.product), r.product)}</td>
                     <td>{w === "open" ? <Pill tone="warn">open</Pill> : <Pill>expired</Pill>}</td>
-                    <td className="small nowrap">{r.enrolBy === undefined ? "no limit" : when(r.enrolBy * 1000)}</td>
+                    <td className="small nowrap">{r.enrolBy === undefined ? "not set" : when(r.enrolBy * 1000)}</td>
                   </tr>
                 ))}
               </tbody>

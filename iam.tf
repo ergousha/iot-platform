@@ -42,12 +42,25 @@ resource "aws_iam_role_policy" "hook" {
 # ---------------------------------------------------------------------------
 # IoT Core'un provisioning sirasinda ustlendigi rol (thing/cert/policy olusturur).
 # ---------------------------------------------------------------------------
+# Confused-deputy guard: IoT may assume it only for this account's own
+# provisioning templates. The ARNs are the string locals (data.tf), not the
+# template resources, which reference this role.
 data "aws_iam_policy_document" "iot_provisioning_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["iot.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = values(local.provisioning_template_arns)
     }
   }
 }

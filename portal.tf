@@ -112,6 +112,20 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "portal" {
   }
 }
 
+# An abandoned multipart upload is billed until aborted (see s3.tf).
+resource "aws_s3_bucket_lifecycle_configuration" "portal" {
+  bucket = aws_s3_bucket.portal.id
+
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+}
+
 resource "aws_cloudfront_origin_access_control" "portal" {
   name                              = local.portal_prefix
   description                       = "Portal SPA in ${aws_s3_bucket.portal.id}"
