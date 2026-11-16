@@ -91,8 +91,8 @@ locals {
 
   # The thing's `product` attribute (the provisioning template sets it). A
   # device may publish straight into its own product's rules over Basic
-  # Ingest (`$aws/rules/<product>_*`): no messaging charge, and no other
-  # product's rules. A thing without the attribute matches nothing.
+  # Ingest (`$aws/rules/<product>_<rule>/<thing>`): no messaging charge, and
+  # no other product's rules. A thing without the attribute matches nothing.
   product = "$${iot:Connection.Thing.Attributes[product]}"
 
   # The device's own Jobs and named-shadow topics. In a policy resource `*`
@@ -106,14 +106,18 @@ locals {
   # (PLATFORM.md §6). In particular no shadow `update/accepted` or
   # `update/documents`: each would echo every report back to the device and
   # double its messaging.
+  #
+  # No Sids: they are optional, and the 2048-character budget is better spent
+  # on resources (the comments name each statement instead).
   device_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid    = "Connect"
+        # Connect
         Effect = "Allow"
         Action = "iot:Connect"
-        # ClientId must be the same as thing name (this is how firmware connects).
+        # ClientId must be the same as thing name (this is how firmware
+        # connects), which is what lets rules trust clientid() as the thing.
         Resource = "${local.iot_arn}:client/${local.thing}"
       },
       # Publish, Subscribe and Receive stay separate: the device must be able to
@@ -121,7 +125,7 @@ locals {
       # that enforceable. Every resource is still pinned to the device's own
       # thing name, so one device can never reach another's topics.
       {
-        Sid    = "Publish"
+        # Publish
         Effect = "Allow"
         Action = "iot:Publish"
         Resource = [
@@ -132,11 +136,17 @@ locals {
           # Named shadows only: `platform` and the product's.
           "${local.iot_arn}:topic/${local.shadow}/get",
           "${local.iot_arn}:topic/${local.shadow}/update",
-          "${local.iot_arn}:topic/$aws/rules/${local.product}_*",
+          # Basic Ingest into the product's own rules, ending in the device's
+          # own thing name: `$aws/rules/<product>_<rule>/<thing>`. A policy
+          # `*` also matches `/`, so this cannot refuse extra segments before
+          # the thing (`$aws/rules/<rule>/<other>/<thing>`), and topic() is
+          # not proof of identity: rules take the thing from clientid(), which
+          # Connect above pins to the thing name.
+          "${local.iot_arn}:topic/$aws/rules/${local.product}_*/${local.thing}",
         ]
       },
       {
-        Sid    = "Subscribe"
+        # Subscribe
         Effect = "Allow"
         Action = "iot:Subscribe"
         Resource = [
@@ -151,10 +161,9 @@ locals {
         ]
       },
       {
-        # Receive applies only to messages of a subscription the statement
+        # Receive. It applies only to messages of a subscription the statement
         # above allowed, so it may stay broad: listing every topic again would
         # not fit the 2048-character limit.
-        Sid    = "Receive"
         Effect = "Allow"
         Action = "iot:Receive"
         Resource = [
