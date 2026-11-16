@@ -40,13 +40,29 @@ resource "aws_dynamodb_table" "presence" {
   }
 }
 
-# The trust policy of IoT rule roles.
+locals {
+  presence_rule_name = replace("${var.project_name}_presence", "-", "_")
+}
+
+# The trust policy of the presence rule's role. Confused-deputy guard: IoT
+# may assume it only for this account's presence rule. The ARN is built as a
+# string: the rule resource references this role.
 data "aws_iam_policy_document" "iot_rule_assume" {
   statement {
     actions = ["sts:AssumeRole"]
     principals {
       type        = "Service"
       identifiers = ["iot.amazonaws.com"]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
+    condition {
+      test     = "ArnEquals"
+      variable = "aws:SourceArn"
+      values   = ["arn:aws:iot:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:rule/${local.presence_rule_name}"]
     }
   }
 }
@@ -66,7 +82,7 @@ resource "aws_iam_role_policy" "presence_rule" {
 }
 
 resource "aws_iot_topic_rule" "presence" {
-  name        = replace("${var.project_name}_presence", "-", "_")
+  name        = local.presence_rule_name
   description = "Lifecycle events -> ${aws_dynamodb_table.presence.name} (OTA controller)."
   enabled     = true
   sql_version = "2016-03-23"

@@ -98,8 +98,8 @@ export type WindowState = "open" | "expired" | "none";
 /** windowState mirrors the controller: allowed, not provisioned, enrol_by ahead. */
 export function windowState(r: RegistryRecord, nowMs: number): WindowState {
   if (!r.allowed || r.provisioned) return "none";
-  if (r.enrolBy === undefined) return "open"; // a record without enrol_by never expires
-  return r.enrolBy * 1000 > nowMs ? "open" : "expired";
+  // No enrol_by: closed, as the controller never arms the claim for it.
+  return r.enrolBy !== undefined && r.enrolBy * 1000 > nowMs ? "open" : "expired";
 }
 
 export type Tone = "ok" | "warn" | "danger" | "info" | "neutral";
@@ -127,7 +127,11 @@ export function enrolment(r: RegistryRecord, nowMs: number): Badge {
     return { label: "Window open", tone: "warn", tip: "The device may enrol now; the claim certificate is active for it." };
   }
   if (w === "expired") {
-    return { label: "Window expired", tone: "neutral", tip: "The enrolment window closed before the device enrolled." };
+    return {
+      label: "Window expired",
+      tone: "neutral",
+      tip: "The enrolment window closed, or never had an end date, before the device enrolled. `ergo commission` opens a new one.",
+    };
   }
   return { label: "Not allowed", tone: "neutral", tip: "allowed=false: this record cannot enrol a device." };
 }
