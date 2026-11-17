@@ -453,6 +453,30 @@ All resources deployed in this repository are serverless and billed purely on-de
 
 The platform keeps no telemetry rules. A product's rules live in its own `cloud/` Terraform root (state `products/<id>/cloud.tfstate` in the state bucket), are named `<id>_*` so the kill switch can disable them, and follow the SDK's capped-target rules (`PLATFORM.md` in iot-device-sdk). The gateway's OPC UA debug rule, off by default, is in its repository's `cloud/` (`terraform apply -var debug_telemetry_logs=true` there for a HIL run).
 
+### Recurring Work
+The only scheduled job is the OTA controller tick ([ota_controller.tf](ota_controller.tf)): EventBridge Scheduler invokes the controller every 15 minutes, 96 times a day, about 2,976 times a month. Everything else is event-driven (pre-provisioning hook, presence rule, kill switch, S3 upload notification, portal) or billed flat.
+
+- **Every tick, per product:** reads the guard state (SSM), scans the registry and presence tables, describes the fleet group, lists the things in the fleet, canary and excluded groups, and lists the IoT jobs and the product's S3 release prefixes. Release manifests and device shadows are read only while a release above the fleet version is pending.
+- **Hourly (the tick at :00):** lists all certificates and things plus each thing's principals (certificate hygiene), makes one GitHub releases request per product, and checks the CloudFront pricing plans.
+
+Expected monthly cost of the tick (eu-central-1 list prices; durations estimated):
+
+| Item | Monthly volume | Expected cost |
+| :--- | :--- | :--- |
+| EventBridge Scheduler | 2,976 invocations | $0 (14M free) |
+| Lambda (128 MB, ~1–3 s per tick) | ~3k invocations, ~400–1,100 GB-s | $0 in the always-free tier (~$0.02 without it) |
+| S3 requests | ~6k LIST | ~$0.03 |
+| DynamoDB on-demand scans | ~6k small reads | < $0.01 |
+| IoT registry reads (billed per record returned, ~$1.25 per million) | ~2,976 × (devices + 6) + 744 × (certificates + 2 × devices) | 10 devices ≈ $0.09, 50 ≈ $0.36, 200 ≈ $1.34 |
+| During a rollout: shadow and manifest reads | devices × 2,976, only while a release is pending | 50 devices ≈ $0.19 if pending all month |
+| CloudWatch Logs (3-day retention) | a few MB | ~$0 |
+
+The IoT Core free tier (225,000 registry or Device Shadow operations a month) covers small fleets, but only for the first 12 months of the account. Altogether the tick costs about $0.05–0.50 a month for up to ~50 devices, mostly IoT registry reads, which grow with the number of devices.
+
+Always on, billed flat: the 6 guard alarms watch exactly the 10 always-free alarm metrics (each extra metric, for example from a product's own alarm, costs $0.10 a month); the 2 budgets have no actions and AWS Cost Anomaly Detection checks daily, both free; both CloudFront distributions are on the Free flat-rate plan.
+
+The portal does not refresh on its own. Each ↻ Refresh calls the controller's `status` for every product, which reads every fleet device's shadow and every release's manifest from S3. That is why there is no automatic refresh: refreshing every minute with a tab open 24/7 would cost roughly $1–5 a month for a small fleet.
+
 ### Teardown
 To destroy all Terraform-managed resources:
 ```sh
