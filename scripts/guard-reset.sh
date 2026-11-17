@@ -11,7 +11,7 @@
 # 4. Clears the state, so claim-window.sh works again.
 #
 # It does not re-activate the claim (INACTIVE is its normal state) and does not
-# re-enable the platform's presence rule: the next `terraform apply` does
+# re-enable the platform's presence rules: the next `terraform apply` does
 # (the portal's "Reset guard" does both). Needs the owner's AWS credentials
 # and jq.
 set -euo pipefail
@@ -75,7 +75,7 @@ done <<<"$rules"
 
 aws ssm put-parameter --name "$param" --type String --overwrite \
   --value "$(jq -c --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{tripped: false, reset_at: $at, last: del(.last)}' <<<"$state")" >/dev/null
-echo "guard reset. Devices reconnect on their next retry; run terraform apply to restore the presence rule."
+echo "guard reset. Devices reconnect on their next retry; run terraform apply to restore the presence rules."
 
 # A budget's ACTUAL alert fires once per month: one already over its limit
 # only re-alerts at 150 %.

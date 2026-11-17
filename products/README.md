@@ -17,7 +17,7 @@ empty).
 | `github_repository` | yes | `owner/name`; only its Environment `release` may publish this product's firmware |
 | `github_repository_id` | yes | The repository's immutable numeric id (`gh api repos/<owner>/<name> --jq .id`) |
 | `soak_hours` | no, 6 | Hours a release runs on the canaries before the fleet job (0–168) |
-| `shadow_name` | no, the id | The product's named shadow, where the portal owner may set desired state; never `platform` |
+| `shadow_name` | no, the id | The product's named shadow, where the portal owner may set desired state; never `platform`. Its devices may use only this shadow and `platform` (the product's shadow policy, on its fleet and excluded groups) |
 | `display_name` | no | The portal name; default the repository name without a trailing `-rust` |
 | `*_name` | no | Pinned resource names; only the gateway uses them, so nothing live is renamed |
 
