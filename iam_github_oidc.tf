@@ -12,6 +12,14 @@ locals {
     for id, p in local.products :
     id => "repo:${split("/", p.github_repository)[0]}@${var.github_owner_id}/${split("/", p.github_repository)[1]}@${p.github_repository_id}:environment:release"
   }
+
+  # The commits of the SDK's release workflow a release may run in, from
+  # release_workflow_commits.json (commit SHA -> note). Only these: `@*`
+  # would also accept the commit of an unmerged pull request, which GitHub
+  # serves from a public repository like any other. CI checks that each one
+  # is on the SDK's main (scripts/check-release-workflow-commits.sh).
+  release_workflow_commits = keys(jsondecode(file("${path.module}/release_workflow_commits.json")))
+  release_workflow_refs    = [for sha in local.release_workflow_commits : "${var.release_workflow}@${sha}"]
 }
 
 resource "aws_iam_openid_connect_provider" "github" {
@@ -21,9 +29,10 @@ resource "aws_iam_openid_connect_provider" "github" {
 }
 
 # One role per product, trusted by that product's repository only, and only
-# from inside the SDK's reusable release workflow (job_workflow_ref): a
-# workflow edited in the product repository cannot assume it. A release of
-# one product therefore cannot write another's firmware.
+# from inside the SDK's reusable release workflow at an approved commit
+# (job_workflow_ref): neither a workflow edited in the product repository nor
+# one pinned to an unapproved SDK commit can assume it. A release of one
+# product therefore cannot write another's firmware.
 data "aws_iam_policy_document" "github_assume_role" {
   for_each = local.products
 
@@ -43,11 +52,12 @@ data "aws_iam_policy_document" "github_assume_role" {
       variable = "token.actions.githubusercontent.com:sub"
       values   = [local.github_oidc_subs[each.key]]
     }
-    # Callers pin the workflow by commit SHA; any ref of it is accepted.
+    # Callers pin the workflow by commit SHA, which job_workflow_ref carries
+    # as its ref: only the approved commits.
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:job_workflow_ref"
-      values   = ["${var.release_workflow}@*"]
+      values   = local.release_workflow_refs
     }
   }
 }
@@ -57,6 +67,13 @@ resource "aws_iam_role" "github_actions" {
 
   name               = each.value.github_actions_role_name
   assume_role_policy = data.aws_iam_policy_document.github_assume_role[each.key].json
+
+  lifecycle {
+    precondition {
+      condition     = length(local.release_workflow_commits) > 0 && alltrue([for sha in local.release_workflow_commits : can(regex("^[0-9a-f]{40}$", sha))])
+      error_message = "release_workflow_commits.json maps full 40-character lowercase commit SHAs of the SDK's release workflow to notes, and lists at least one."
+    }
+  }
 }
 
 data "aws_iam_policy_document" "github_actions_policy" {
