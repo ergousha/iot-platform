@@ -74,6 +74,13 @@ jobs:
       - name: Terraform Validate
         run: terraform validate
 
+      # The GitHub OIDC roles accept releases only from these SDK commits; an
+      # unmerged pull request's commit must never be among them.
+      - name: Release workflow commits are on the SDK's main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-release-workflow-commits.sh
+
       # Pinned: `latest` picked up v0.54's removal of the `module` attribute
       # and broke every build. Bump deliberately.
       - name: Setup TFLint

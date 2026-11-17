@@ -303,7 +303,9 @@ CI runs the same checks: [`ci.yml`](.github/workflows/ci.yml) (Go, Terraform wit
 ### Secure GitHub Actions OIDC Trust
 This infrastructure uses AWS IAM Identity Federation via OpenID Connect (OIDC) to grant secure access to GitHub Actions runners without requiring long-lived AWS secrets to be saved in GitHub.
 
-Each product has its own role ([iam_github_oidc.tf](iam_github_oidc.tf)), trusted only by its repository's Environment `release` (`sub = repo:<owner>@<id>/<repo>@<id>:environment:release`) and only inside the SDK's reusable release workflow (`job_workflow_ref`). It may put and get `releases/<product>/*`, nothing else: no SSM, no IoT.
+Each product has its own role ([iam_github_oidc.tf](iam_github_oidc.tf)), trusted only by its repository's Environment `release` (`sub = repo:<owner>@<id>/<repo>@<id>:environment:release`) and only inside the SDK's reusable release workflow (`job_workflow_ref`) at a commit listed in [release_workflow_commits.json](release_workflow_commits.json). It may put and get `releases/<product>/*`, nothing else: no SSM, no IoT.
+
+The list is exact on purpose: `firmware-release.yml@*` would also accept the commit of an unmerged pull request to the public SDK, which a product's `release.yml` could pin. CI ([scripts/check-release-workflow-commits.sh](scripts/check-release-workflow-commits.sh)) fails unless every listed commit is on the SDK's `main`. When the release workflow changes: merge the SDK pull request (with a merge commit), add its commit here and apply, then bump the products' `release.yml` pins; remove a commit once no product pins it.
 
 | Product | Role (the repository's `AWS_ROLE_ARN` variable) | May write |
 | :--- | :--- | :--- |

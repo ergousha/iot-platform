@@ -107,7 +107,7 @@ variable "firmware_download_url_template" {
 }
 
 variable "release_workflow" {
-  description = "The reusable workflow (owner/repo/path, no ref) every product's release must run in to assume its GitHub OIDC role (the job_workflow_ref claim)."
+  description = "The reusable workflow (owner/repo/path, no ref) every product's release must run in to assume its GitHub OIDC role (the job_workflow_ref claim), at one of the commits in release_workflow_commits.json."
   type        = string
   default     = "ergousha/iot-device-sdk/.github/workflows/firmware-release.yml"
 }
