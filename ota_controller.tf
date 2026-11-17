@@ -229,6 +229,14 @@ data "aws_iam_policy_document" "ota_controller" {
     actions   = ["iot:EnableTopicRule"]
     resources = concat([for r in local.guard_restore_rules : "${local.iot_arn}:rule/${r}"], local.guard_product_rule_arns)
   }
+
+  # The hourly check that every CloudFront distribution is on the Free
+  # flat-rate plan. A list call: no resource-level permission.
+  statement {
+    sid       = "PricingPlans"
+    actions   = ["pricingplanmanager:ListSubscriptions"]
+    resources = ["*"]
+  }
 }
 
 resource "aws_iam_role_policy" "ota_controller" {
@@ -285,6 +293,7 @@ resource "aws_lambda_function" "ota_controller" {
       DENY_POLICY                      = aws_iot_policy.guard_deny_all.name
       RESTORE_RULES                    = jsonencode(local.guard_restore_rules)
       VIEWER_ROLES                     = jsonencode([local.portal_viewer_role_name])
+      CLOUDFRONT_DISTRIBUTIONS         = jsonencode({ for name, d in local.cloudfront_distributions : name => d.arn })
     }
   }
 

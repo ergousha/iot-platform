@@ -162,6 +162,8 @@ s3://esp32-ztp-firmware-<account>/releases/<product>/<X.Y.Z>/
 
 The images are public through CloudFront ([cloudfront.tf](cloudfront.tf)): `https://<distribution>/<product>/<X.Y.Z>/app.bin`. Images carry no secrets, so no presigned URLs: the job document holds a stable URL, and a device's Range resume survives reboots.
 
+**Egress exposure.** Anyone may download the images, so a download flood is the risk. Both distributions (firmware and portal) are on the CloudFront **Free flat-rate plan**, managed in Terraform (`aws_pricingplanmanager_subscription`, never destroyed by it). The plan bills no overage however far traffic passes its allowance (1M requests and 100 GB a month; delivery may be slowed instead), so a flood costs nothing, and the kill switch leaves CloudFront alone. Off the plan, pay-as-you-go applies past the always-free 1 TB and 10M requests, so the controller checks every hour that each distribution is in an ACTIVE Free subscription with its WAF web ACL and no cancellation or downgrade pending, and emails once if not. Missing paths are cached for 5 minutes, so probing random URLs barely reaches S3. The fallback is GitHub Releases (`firmware_download_url_template`); it is not the default because a release asset can be replaced on a re-run, while each S3 release is immutable.
+
 ### The controller
 
 It runs every 15 minutes (the source of truth), on the S3 event of each `manifest.sig` (the same, sooner), and on owner overrides. Per product:
@@ -423,7 +425,7 @@ scripts/portal-user.sh add <name> <email> owner # Cognito emails a temporary pas
 terraform output portal_url
 ```
 
-Then put the portal distribution on the CloudFront **Free flat-rate plan** in the console, as for the firmware distribution. `scripts/portal-user.sh role <name> viewer|owner|none` changes a role and ends the user's sessions; `remove` deletes a user.
+`terraform apply` also puts both distributions on the CloudFront **Free flat-rate plan** (a distribution subscribed in the console earlier is imported first; see [cloudfront.tf](cloudfront.tf)). `scripts/portal-user.sh role <name> viewer|owner|none` changes a role and ends the user's sessions; `remove` deletes a user.
 
 **Checks after the first deploy**:
 
@@ -444,9 +446,9 @@ All resources deployed in this repository are serverless and billed purely on-de
 | **AWS Lambda** | per invocation & duration | Billed per millisecond; free tier covers PoC |
 | **Amazon S3** | per GB-month & requests | Storage cost for binaries is fractions of a cent |
 | **CloudWatch Logs** | per GB ingested/stored | Kept low via a 3-day retention period; no telemetry is routed here by the platform |
-| **CloudFront** (firmware) | Free flat-rate plan | $0, no overage (attach the plan in the console after the first apply; see [cloudfront.tf](cloudfront.tf)) |
+| **CloudFront** (firmware) | Free flat-rate plan | $0, no overage (managed in Terraform and checked hourly; see [cloudfront.tf](cloudfront.tf)) |
 | **EventBridge Scheduler** | 2,976 ticks a month | $0 (14M free invocations) |
-| **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: 8 of the 10 free alarm metrics, a handful of messages, budgets without actions |
+| **CloudWatch alarms, SNS, Budgets** | per alarm metric, message, action | $0: all 10 free alarm metrics, a handful of messages, budgets without actions |
 | **Portal**: Cognito Essentials, identity pool, CloudFront (Free plan), S3 | per MAU (Essentials: free up to 10,000) | $0 |
 
 The platform keeps no telemetry rules. A product's rules live in its own `cloud/` Terraform root (state `products/<id>/cloud.tfstate` in the state bucket), are named `<id>_*` so the kill switch can disable them, and follow the SDK's capped-target rules (`PLATFORM.md` in iot-device-sdk). The gateway's OPC UA debug rule, off by default, is in its repository's `cloud/` (`terraform apply -var debug_telemetry_logs=true` there for a HIL run).

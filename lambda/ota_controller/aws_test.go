@@ -545,6 +545,7 @@ func TestLoadConfig(t *testing.T) {
 		"OTA_ROLLOUT_MAX_PER_MINUTE": "20", "OTA_IN_PROGRESS_TIMEOUT_MINUTES": "60",
 		"QUARANTINE_GROUP_ARN": "arn:aws:iot:eu-central-1:1:thinggroup/q", "DENY_POLICY": "d",
 		"RESTORE_RULES": `["r"]`, "VIEWER_ROLES": `[]`,
+		"CLOUDFRONT_DISTRIBUTIONS": `{"firmware":"arn:aws:cloudfront::1:distribution/E1"}`,
 		"PRODUCTS": `{"vaktus":{"fleet_group_arn":"` + vaktus.Fleet.ARN + `","canary_group_arn":"` + vaktus.Canary.ARN +
 			`","excluded_group_arn":"` + vaktus.Excluded.ARN + `","repository":"ergousha/x","soak_hours":24}}`,
 	}
@@ -552,7 +553,7 @@ func TestLoadConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Quarantine.Name != "q" || len(c.RestoreRules) != 1 || len(c.ViewerRoles) != 0 {
+	if c.Quarantine.Name != "q" || len(c.RestoreRules) != 1 || len(c.ViewerRoles) != 0 || c.Distributions["firmware"] != "arn:aws:cloudfront::1:distribution/E1" {
 		t.Errorf("guard config %+v", c)
 	}
 	if c.Products["vaktus"].Canary.Name != "esp32-ztp-vaktus-canary" || c.downloadURL(c.Products["vaktus"], ver("1.2.3")) != "https://d.cloudfront.net/vaktus/1.2.3/app.bin" {
@@ -562,8 +563,9 @@ func TestLoadConfig(t *testing.T) {
 	env["PRODUCTS"] = `{"Bad":{}}`
 	delete(env, "CLAIM_POLICY")
 	env["VIEWER_ROLES"] = "viewer"
+	env["CLOUDFRONT_DISTRIBUTIONS"] = `{"portal":"arn:aws:s3:::bucket"}`
 	_, err = loadConfig(func(k string) string { return env[k] })
-	for _, want := range []string{"DOWNLOAD_URL_TEMPLATE", "Bad", "CLAIM_POLICY", "VIEWER_ROLES"} {
+	for _, want := range []string{"DOWNLOAD_URL_TEMPLATE", "Bad", "CLAIM_POLICY", "VIEWER_ROLES", "CLOUDFRONT_DISTRIBUTIONS[portal]"} {
 		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Errorf("missing %s in %v", want, err)
 		}

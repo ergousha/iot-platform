@@ -21,9 +21,9 @@
 #
 # Cost: $0. Cognito Essentials (10,000 monthly active users free, with no
 # end date) and identity pools are free at this size,
-# CloudFront is on the Free flat-rate plan (attach it in the console after the
-# first apply, as for the firmware distribution in cloudfront.tf) which
-# includes the headers function, and the bucket holds a few hundred KB.
+# CloudFront is on the Free flat-rate plan (aws_pricingplanmanager_subscription
+# in cloudfront.tf, checked hourly by the OTA controller) which includes the
+# headers function, and the bucket holds a few hundred KB.
 #
 # Users are not in Terraform (their emails would be in state):
 # scripts/portal-user.sh adds them. The SPA is not either:
