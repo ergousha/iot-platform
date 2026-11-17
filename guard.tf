@@ -9,6 +9,9 @@
 #   traffic       + killable IoT rules disabled (both presence rules,
 #                   products' <id>_*)
 #   fleet         + deny-all policy on every fleet group (devices go offline)
+# CloudFront is not in any scope: both distributions are on the Free
+# flat-rate plan, which bills no overage, and the OTA controller emails
+# hourly if one is not (cloudfront.tf).
 # scripts/guard-reset.sh undoes a trip. Cost: $0 (all 10 free alarm metrics,
 # budgets without actions, Lambda and SNS inside the free tier). Another alarm
 # metric costs $0.10 a month: none is left.

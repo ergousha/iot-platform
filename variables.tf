@@ -92,9 +92,11 @@ variable "ota_in_progress_timeout_minutes" {
 variable "firmware_download_url_template" {
   description = <<-EOT
     Image URL put into OTA job documents, with {product}, {version} and
-    {repository} placeholders. Empty: the firmware CloudFront distribution,
+    {repository} placeholders. Empty: the firmware CloudFront distribution
+    (on the Free flat-rate plan: no egress bill),
     https://<distribution>/{product}/{version}/app.bin. The fallback if the
-    distribution cannot be on the CloudFront Free plan:
+    distribution cannot be on that plan (cloudfront.tf says why it is not the
+    default):
     https://github.com/{repository}/releases/download/v{version}/app.bin
   EOT
   type        = string

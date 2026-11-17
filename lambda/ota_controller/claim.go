@@ -37,6 +37,9 @@ type ClaimState struct {
 	RotatedAt     string `json:"rotated_at,omitempty"`
 	// Notified is the key of the last one-off claim email.
 	Notified string `json:"notified,omitempty"`
+	// PricingPlan is what the last CloudFront pricing plan email reported;
+	// empty while every distribution is on the Free plan (checkPricingPlans).
+	PricingPlan string `json:"pricing_plan,omitempty"`
 }
 
 // certID is the AWS IoT certificate id of a PEM: the SHA-256 of its DER.

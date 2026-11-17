@@ -102,6 +102,7 @@ type App struct {
 	ssm    SSMAPI
 	ddb    DynamoAPI
 	sns    SNSAPI
+	plans  PricingPlanAPI
 	http   HTTPDoer
 	now    func() time.Time
 	sleep  func(time.Duration) // nil: time.Sleep

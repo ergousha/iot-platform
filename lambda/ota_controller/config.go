@@ -75,6 +75,10 @@ type Config struct {
 	// read (the portal's viewer role).
 	ViewerRoles []string
 
+	// Distributions are the CloudFront distributions (name -> ARN) that must
+	// stay on the Free flat-rate plan (checkPricingPlans).
+	Distributions map[string]string
+
 	RolloutBaseRatePerMinute int32
 	RolloutIncrementFactor   float64
 	RolloutSucceededThings   int32
@@ -164,6 +168,16 @@ func loadConfig(getenv func(string) string) (Config, error) {
 	c.DenyPolicy = p.required("DENY_POLICY")
 	c.RestoreRules = p.stringList("RESTORE_RULES")
 	c.ViewerRoles = p.stringList("VIEWER_ROLES")
+	if raw := p.required("CLOUDFRONT_DISTRIBUTIONS"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &c.Distributions); err != nil {
+			p.errs = append(p.errs, errors.New("CLOUDFRONT_DISTRIBUTIONS must be a JSON object of name -> distribution ARN"))
+		}
+		for name, value := range c.Distributions {
+			if a, err := arn.Parse(value); err != nil || a.Service != "cloudfront" || !strings.HasPrefix(a.Resource, "distribution/") {
+				p.errs = append(p.errs, fmt.Errorf("CLOUDFRONT_DISTRIBUTIONS[%s]=%q: not a CloudFront distribution ARN", name, value))
+			}
+		}
+	}
 	if c.DownloadURLTemplate != "" && (!strings.HasPrefix(c.DownloadURLTemplate, "https://") || !strings.Contains(c.DownloadURLTemplate, "{version}")) {
 		p.errs = append(p.errs, fmt.Errorf("DOWNLOAD_URL_TEMPLATE=%q: must be an https URL with a {version} placeholder", c.DownloadURLTemplate))
 	}

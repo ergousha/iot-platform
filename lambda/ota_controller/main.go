@@ -42,6 +42,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iot"
 	"github.com/aws/aws-sdk-go-v2/service/iotdataplane"
+	"github.com/aws/aws-sdk-go-v2/service/pricingplanmanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sns"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
@@ -224,6 +225,9 @@ func (a *App) tick(ctx context.Context, only map[string]bool, hourly bool) (Resu
 		if err := a.certHygiene(ctx, g.presence); err != nil {
 			errs = append(errs, fmt.Errorf("certificate hygiene: %w", err))
 		}
+		if err := a.checkPricingPlans(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("CloudFront pricing plans: %w", err))
+		}
 	}
 	return Result{OK: len(errs) == 0, Log: log}, errors.Join(errs...)
 }
@@ -364,12 +368,13 @@ func main() {
 		shadow: iotdataplane.NewFromConfig(awsCfg, func(o *iotdataplane.Options) {
 			o.BaseEndpoint = aws.String("https://" + cfg.IoTDataEndpoint)
 		}),
-		s3:   s3.NewFromConfig(awsCfg),
-		ssm:  ssm.NewFromConfig(awsCfg),
-		ddb:  dynamodb.NewFromConfig(awsCfg),
-		sns:  sns.NewFromConfig(awsCfg),
-		http: &http.Client{Timeout: 5 * time.Second},
-		now:  time.Now,
+		s3:    s3.NewFromConfig(awsCfg),
+		ssm:   ssm.NewFromConfig(awsCfg),
+		ddb:   dynamodb.NewFromConfig(awsCfg),
+		sns:   sns.NewFromConfig(awsCfg),
+		plans: pricingplanmanager.NewFromConfig(awsCfg),
+		http:  &http.Client{Timeout: 5 * time.Second},
+		now:   time.Now,
 	}
 	lambda.Start(app.Handle)
 }
