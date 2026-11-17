@@ -213,7 +213,7 @@ A thing is in one group of a hierarchy, so canaries and the rest of the fleet ar
 
 ### Presence
 
-A rule writes every connect and disconnect lifecycle event into `esp32-ztp-device-presence` ([presence.tf](presence.tf)), one item per thing and event type. The controller reads it for the canary choice and the soak gate, and to tell which certificate a re-enrolled device now uses.
+Two rules write every `connected` and `disconnected` lifecycle event into `esp32-ztp-device-presence` ([presence.tf](presence.tf)), one item per thing and event type. `connect_failed` matches neither: a refused Connect may carry any client id, so it never writes a row. The controller reads the table for the canary choice and the soak gate, and to tell which certificate a re-enrolled device now uses. A device is online when its last connect is newer than its last disconnect: by timestamp, or by session number (`versionNumber`) when the two are within ten minutes of each other, since a replaced session's disconnect can come a moment after the new connect. AWS restarts the session number after about an hour offline, so it never decides events further apart. The claim tick runs before the presence and job scans, so a failing scan never keeps an expired enrolment window armed.
 
 ### The claim
 
@@ -333,7 +333,7 @@ Denial-of-wallet is the main threat to a self-funded platform. [guard.tf](guard.
 The measured baseline was at most 48 publishes and 4 connects per 5 minutes. Each scope includes the ones above it:
 
 * **provisioning**: the claim certificate (every target of the claim policy) goes INACTIVE.
-* **traffic**: the presence rule and every enabled product rule (`<product>_*`, from a product's `cloud/`) are disabled (while it lasts, the soak gate sees no reconnects). The product rules it disabled are listed in the guard state (`disabled_rules`); a reset, from the portal or `guard-reset.sh`, enables exactly those again.
+* **traffic**: the two presence rules and every enabled product rule (`<product>_*`, from a product's `cloud/`) are disabled (while it lasts, the soak gate sees no reconnects). The product rules it disabled are listed in the guard state (`disabled_rules`); a reset, from the portal or `guard-reset.sh`, enables exactly those again.
 * **fleet**: the deny-all policy `esp32-ztp-guard-deny-all` is attached to every fleet and excluded group. Every device is refused on its next publish or connect, so the fleet goes offline and messaging cost stops.
 
 Every trip is recorded in the SSM parameter `/esp32-ztp/guard/state`. `claim-window.sh` refuses to open a window while it is tripped. Once you know why it tripped:

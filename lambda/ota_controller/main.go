@@ -166,20 +166,32 @@ func (a *App) functionURL(ctx context.Context, ev event) events.LambdaFunctionUR
 
 // tick reconciles the given products (nil: all) and, on the scheduled tick,
 // the claim. Hourly ticks also check GitHub and clean certificates.
+//
+// The claim comes first, on the registry alone: the job and presence scans
+// after it (the presence table's read capacity is capped) must never keep an
+// expired enrolment window armed. An unreadable registry disarms the claim,
+// as a tripped guard does.
 func (a *App) tick(ctx context.Context, only map[string]bool, hourly bool) (Result, error) {
-	g, err := a.loadGlobal(ctx)
-	if err != nil {
-		return Result{}, err
-	}
 	guard, gerr := a.guard(ctx)
 	var errs []error
 	if gerr != nil {
 		errs = append(errs, gerr)
 	}
+	records, rerr := a.loadRecords(ctx)
+	if rerr != nil {
+		errs = append(errs, rerr)
+	}
 	if only == nil {
-		if err := a.claimTick(ctx, g.records, guard.Tripped); err != nil {
+		if err := a.claimTick(ctx, records, guard.Tripped || rerr != nil); err != nil {
 			errs = append(errs, fmt.Errorf("claim: %w", err))
 		}
+	}
+	if rerr != nil {
+		return Result{}, errors.Join(errs...)
+	}
+	g, err := a.loadScans(ctx, records)
+	if err != nil {
+		return Result{}, errors.Join(append(errs, err)...)
 	}
 	if guard.Tripped {
 		slog.Warn("Guard tripped: no rollout", "scope", guard.Scope)

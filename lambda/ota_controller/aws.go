@@ -195,20 +195,45 @@ func (a *App) loadRecords(ctx context.Context) ([]Record, error) {
 	return out, nil
 }
 
-// loadPresence reads the presence table the lifecycle rule writes: one item
+// presenceEvent is a thing's latest connected or disconnected event.
+type presenceEvent struct {
+	at        time.Time
+	session   int64 // versionNumber
+	principal string
+}
+
+// sessionWindow is how far apart a connect and a disconnect may be for the
+// session number to order them. AWS IoT restarts a client id's versionNumber
+// after it has been disconnected for about an hour, so beyond that the
+// numbers mean nothing and only the timestamps do. Within it they are
+// what tells a replaced session's disconnect, which can come a moment after
+// the new session's connect, from a real disconnect.
+const sessionWindow = 10 * time.Minute
+
+// connectedLast tells whether the connect c is newer than the disconnect d:
+// by session number when the two are close together and the sessions
+// differ, otherwise by timestamp (a tie counts as online).
+func connectedLast(c, d presenceEvent) bool {
+	gap := c.at.Sub(d.at)
+	if gap < 0 {
+		gap = -gap
+	}
+	if gap <= sessionWindow && c.session != d.session {
+		return c.session > d.session
+	}
+	return !c.at.Before(d.at)
+}
+
+// loadPresence reads the presence table the lifecycle rules write: one item
 // per thing and event type (connected, disconnected), each the latest.
 // A thing is online when its latest connect is newer than its latest
-// disconnect (versionNumber orders the sessions; events can arrive late).
+// disconnect (connectedLast).
 func (a *App) loadPresence(ctx context.Context) (map[string]*Device, error) {
 	items, err := a.scanAll(ctx, a.cfg.PresenceTable)
 	if err != nil {
 		return nil, err
 	}
-	type ev struct {
-		at        time.Time
-		session   int64
-		principal string
-	}
+	type ev = presenceEvent
 	conn, disc := map[string]ev{}, map[string]ev{}
 	for _, it := range items {
 		e := ev{at: time.UnixMilli(attrN(it, "at")), session: attrN(it, "session"), principal: attrS(it, "principal")}
@@ -224,7 +249,7 @@ func (a *App) loadPresence(ctx context.Context) (map[string]*Device, error) {
 		d, seen := disc[thing]
 		out[thing] = &Device{
 			Thing:       thing,
-			Online:      !seen || c.session > d.session || (c.session == d.session && c.at.After(d.at)),
+			Online:      !seen || connectedLast(c, d),
 			ConnectedAt: c.at,
 			Principal:   c.principal,
 		}
@@ -246,15 +271,21 @@ func (a *App) listAllJobs(ctx context.Context) ([]iottypes.JobSummary, error) {
 }
 
 func (a *App) loadGlobal(ctx context.Context) (*global, error) {
-	g := &global{}
+	records, err := a.loadRecords(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return a.loadScans(ctx, records)
+}
+
+// loadScans adds the jobs and presence to records already read.
+func (a *App) loadScans(ctx context.Context, records []Record) (*global, error) {
+	g := &global{records: records}
 	var err error
 	if g.jobs, err = a.listAllJobs(ctx); err != nil {
 		return nil, err
 	}
 	if g.presence, err = a.loadPresence(ctx); err != nil {
-		return nil, err
-	}
-	if g.records, err = a.loadRecords(ctx); err != nil {
 		return nil, err
 	}
 	return g, nil

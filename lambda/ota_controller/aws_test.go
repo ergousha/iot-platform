@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -100,9 +101,13 @@ func (f *fakeSNS) Publish(_ context.Context, in *sns.PublishInput, _ ...func(*sn
 type fakeDDB struct {
 	DynamoAPI
 	tables map[string][]map[string]ddbtypes.AttributeValue
+	fail   map[string]error // table -> the error its scan returns
 }
 
 func (f *fakeDDB) Scan(_ context.Context, in *dynamodb.ScanInput, _ ...func(*dynamodb.Options)) (*dynamodb.ScanOutput, error) {
+	if err := f.fail[aws.ToString(in.TableName)]; err != nil {
+		return nil, err
+	}
 	return &dynamodb.ScanOutput{Items: f.tables[aws.ToString(in.TableName)]}, nil
 }
 
@@ -116,6 +121,15 @@ type fakeIoT struct {
 	// execs: job id -> thing -> status (and reason, for failures).
 	execs  map[string]map[string][2]string
 	listed []string // jobs whose executions were listed
+	// listJobsErr: what ListJobs returns (it lists no jobs otherwise).
+	listJobsErr error
+}
+
+func (f *fakeIoT) ListJobs(context.Context, *iot.ListJobsInput, ...func(*iot.Options)) (*iot.ListJobsOutput, error) {
+	if f.listJobsErr != nil {
+		return nil, f.listJobsErr
+	}
+	return &iot.ListJobsOutput{}, nil
 }
 
 func (f *fakeIoT) ListJobExecutionsForJob(_ context.Context, in *iot.ListJobExecutionsForJobInput, _ ...func(*iot.Options)) (*iot.ListJobExecutionsForJobOutput, error) {
@@ -368,6 +382,17 @@ func TestShadowAndPresence(t *testing.T) {
 		item("DOWN", "connected", 1000, 7),
 		item("DOWN", "disconnected", 1500, 7),
 		item("NEW", "connected", 1000, 1),
+		// Back after over an hour offline: AWS restarted versionNumber, so
+		// the new connect has the lower session.
+		item("BACK", "disconnected", 1000, 9),
+		item("BACK", "connected", 1000+2*3600*1000, 0),
+		// And gone again within that new session.
+		item("GONE", "connected", 1000+2*3600*1000, 0),
+		item("GONE", "disconnected", 1000+3*3600*1000, 0),
+		// An old connect with a high session and a much later disconnect
+		// with a restarted one: offline.
+		item("STALE", "connected", 1000, 12),
+		item("STALE", "disconnected", 1000+5*3600*1000, 1),
 	}
 	p, err := a.loadPresence(context.Background())
 	if err != nil {
@@ -375,6 +400,48 @@ func TestShadowAndPresence(t *testing.T) {
 	}
 	if !p["UP"].Online || p["DOWN"].Online || !p["NEW"].Online || p["UP"].Principal != "cert-UP" {
 		t.Errorf("presence UP=%+v DOWN=%+v NEW=%+v", p["UP"], p["DOWN"], p["NEW"])
+	}
+	if !p["BACK"].Online || p["GONE"].Online || p["STALE"].Online {
+		t.Errorf("session restart BACK=%+v GONE=%+v STALE=%+v", p["BACK"], p["GONE"], p["STALE"])
+	}
+}
+
+// The claim tick runs on the registry alone, before the job and presence
+// scans: a failing scan must not keep an expired window's claim armed, and an
+// unreadable registry disarms it.
+func TestTickDisarmsAnExpiredClaimWhenScansFail(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*fakeIoT, *fakeDDB)
+	}{
+		{"presence scan throttled", func(_ *fakeIoT, d *fakeDDB) {
+			d.fail = map[string]error{"presence": errors.New("ProvisionedThroughputExceededException")}
+		}},
+		{"jobs unlisted", func(i *fakeIoT, _ *fakeDDB) { i.listJobsErr = errors.New("ThrottlingException") }},
+		{"registry unreadable", func(_ *fakeIoT, d *fakeDDB) {
+			d.fail = map[string]error{"registry": errors.New("ProvisionedThroughputExceededException")}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			a, _, _, iotf, _, ddbf := testApp()
+			// A claim in place (the first tick creates one), then armed for
+			// a window that has since expired.
+			if err := a.claimTick(ctx, nil, false); err != nil {
+				t.Fatal(err)
+			}
+			_, id := testCert(1)
+			iotf.certs[id] = iottypes.CertificateStatusActive
+			ddbf.tables["registry"] = []map[string]ddbtypes.AttributeValue{registryItem("AA:BB:CC:DD:EE:FF", false, t0.Add(-time.Hour))}
+			tc.break_(iotf, ddbf)
+
+			if _, err := a.tick(ctx, nil, false); err == nil {
+				t.Error("tick hid the failing scan")
+			}
+			if iotf.certs[id] != iottypes.CertificateStatusInactive {
+				t.Errorf("claim left %s", iotf.certs[id])
+			}
+		})
 	}
 }
 

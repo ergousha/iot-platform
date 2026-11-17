@@ -95,10 +95,18 @@ locals {
   # no other product's rules. A thing without the attribute matches nothing.
   product = "$${iot:Connection.Thing.Attributes[product]}"
 
-  # The device's own Jobs and named-shadow topics. In a policy resource `*`
-  # matches any characters, `/` included; MQTT wildcards are literal.
-  jobs   = "$aws/things/${local.thing}/jobs"
-  shadow = "$aws/things/${local.thing}/shadow/name/*"
+  # The device's own Jobs topics. In a policy resource `*` matches any
+  # characters, `/` included; MQTT wildcards are literal.
+  jobs = "$aws/things/${local.thing}/jobs"
+
+  # The named shadows a product's devices use: the platform's and the
+  # product's own (products/<id>.json shadow_name). Exactly these, never
+  # shadow/name/*: a device could otherwise create any number of shadows on
+  # its thing and send each 8 KB updates, billed per KB at five times the
+  # messaging rate.
+  device_shadows = {
+    for id, p in local.products : id => distinct(["platform", p.shadow_name])
+  }
 }
 
 locals {
@@ -133,9 +141,7 @@ locals {
           # DescribeJobExecution ($next or a job id) and UpdateJobExecution.
           "${local.iot_arn}:topic/${local.jobs}/*/get",
           "${local.iot_arn}:topic/${local.jobs}/*/update",
-          # Named shadows only: `platform` and the product's.
-          "${local.iot_arn}:topic/${local.shadow}/get",
-          "${local.iot_arn}:topic/${local.shadow}/update",
+          # Shadows: aws_iot_policy.device_shadow, on the product's groups.
           # Basic Ingest into the product's own rules, ending in the device's
           # own thing name: `$aws/rules/<product>_<rule>/<thing>`. A policy
           # `*` also matches `/`, so this cannot refuse extra segments before
@@ -155,9 +161,6 @@ locals {
           "${local.iot_arn}:topicfilter/${local.jobs}/notify-next",
           "${local.iot_arn}:topicfilter/${local.jobs}/*/accepted",
           "${local.iot_arn}:topicfilter/${local.jobs}/*/rejected",
-          "${local.iot_arn}:topicfilter/${local.shadow}/get/*",
-          "${local.iot_arn}:topicfilter/${local.shadow}/update/delta",
-          "${local.iot_arn}:topicfilter/${local.shadow}/update/rejected",
         ]
       },
       {
@@ -188,6 +191,88 @@ resource "aws_iot_policy" "device" {
       error_message = "The device policy is ${length(local.device_policy)} characters; AWS IoT allows 2048."
     }
   }
+
+  # Devices lose shadow access with this policy's update; their product's
+  # shadow policy must be on the groups first.
+  depends_on = [aws_iot_policy_attachment.device_shadow]
+}
+
+# ---------------------------------------------------------------------------
+# Named-shadow access, one policy per product, on the product's fleet group
+# (inherited by its canary group) and its excluded group: every group a
+# provisioned device of the product is in. Two explicit shadows would not fit
+# the device policy's 2048 characters next to everything else, and a group
+# policy needs no per-device attribute. AWS applies a group's policies only
+# when the client id is the thing name, which the device policy's Connect
+# already demands. A group takes at most two policies: this one and, during a
+# fleet-scope trip, the kill switch's deny-all (an explicit Deny wins).
+# ---------------------------------------------------------------------------
+locals {
+  device_shadow_policies = {
+    for id, names in local.device_shadows : id => jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          # Publish: get and update only (no delete).
+          Effect = "Allow"
+          Action = "iot:Publish"
+          Resource = flatten([
+            for n in names : [
+              "${local.iot_arn}:topic/$aws/things/${local.thing}/shadow/name/${n}/get",
+              "${local.iot_arn}:topic/$aws/things/${local.thing}/shadow/name/${n}/update",
+            ]
+          ])
+        },
+        {
+          # Subscribe: the answers the firmware acts on. No update/accepted
+          # or update/documents: each would echo every report back to the
+          # device and double its messaging. Receive is the device policy's.
+          Effect = "Allow"
+          Action = "iot:Subscribe"
+          Resource = flatten([
+            for n in names : [
+              "${local.iot_arn}:topicfilter/$aws/things/${local.thing}/shadow/name/${n}/get/*",
+              "${local.iot_arn}:topicfilter/$aws/things/${local.thing}/shadow/name/${n}/update/delta",
+              "${local.iot_arn}:topicfilter/$aws/things/${local.thing}/shadow/name/${n}/update/rejected",
+            ]
+          ])
+        },
+      ]
+    })
+  }
+
+  # (product, group) pairs the shadow policy is attached to.
+  device_shadow_targets = merge([
+    for id in keys(local.products) : {
+      "${id}/fleet"    = { product = id, group = aws_iot_thing_group.fleet[id].arn }
+      "${id}/excluded" = { product = id, group = aws_iot_thing_group.excluded[id].arn }
+    }
+  ]...)
+}
+
+resource "aws_iot_policy" "device_shadow" {
+  for_each = local.products
+
+  name   = "${var.project_name}-${each.key}-shadow-policy"
+  policy = local.device_shadow_policies[each.key]
+
+  lifecycle {
+    precondition {
+      condition     = length(local.device_shadow_policies[each.key]) <= 2048
+      error_message = "The ${each.key} shadow policy is ${length(local.device_shadow_policies[each.key])} characters; AWS IoT allows 2048."
+    }
+    precondition {
+      condition     = alltrue([for n in local.device_shadows[each.key] : can(regex("^[A-Za-z0-9_-]{1,64}$", n))])
+      error_message = "A shadow name is 1-64 letters, digits, - or _ (no wildcard)."
+    }
+  }
+}
+
+resource "aws_iot_policy_attachment" "device_shadow" {
+  for_each = local.device_shadow_targets
+
+  policy = aws_iot_policy.device_shadow[each.value.product].name
+  target = each.value.group
 }
 
 # ---------------------------------------------------------------------------

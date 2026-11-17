@@ -6,16 +6,19 @@
 # to one SNS topic. The topic emails the owner and invokes the kill switch,
 # which acts by scope:
 #   provisioning  claim certificate INACTIVE
-#   traffic       + killable IoT rules disabled (presence, products' <id>_*)
+#   traffic       + killable IoT rules disabled (both presence rules,
+#                   products' <id>_*)
 #   fleet         + deny-all policy on every fleet group (devices go offline)
-# scripts/guard-reset.sh undoes a trip. Cost: $0 (8 of the 10 free alarm
-# metrics, budgets without actions, Lambda and SNS inside the free tier).
+# scripts/guard-reset.sh undoes a trip. Cost: $0 (all 10 free alarm metrics,
+# budgets without actions, Lambda and SNS inside the free tier). Another alarm
+# metric costs $0.10 a month: none is left.
 #
 # Limits worth knowing: the publish alarms count messages, not bytes (AWS/IoT
 # has no inbound-bytes metric, and Device Defender is not available), so a
 # flood of large messages just under the threshold is bounded by the budgets
 # alone, hours later. And an ACTUAL budget alert fires once per month, so each
-# budget also re-alerts at 150 % in case the guard was reset that month.
+# budget re-alerts at 150, 200, 300 and 500 % in case the guard was reset that
+# month.
 # ===========================================================================
 
 locals {
@@ -40,14 +43,12 @@ locals {
 
   # Platform rules the traffic scope disables. Their per-message cost (rule,
   # action) is what an attacker with a device certificate could drive.
-  guard_killable_rules = [
-    aws_iot_topic_rule.presence.name,
-  ]
+  guard_killable_rules = [for r in aws_iot_topic_rule.presence : r.name]
 
   # The killable rules Terraform keeps enabled: what a guard reset through
   # the OTA controller (the portal) re-enables. guard-reset.sh leaves this
   # to the next apply.
-  guard_restore_rules = [aws_iot_topic_rule.presence.name]
+  guard_restore_rules = [for r in aws_iot_topic_rule.presence : r.name]
 
   # Product rules (plan §7) live in each product's cloud/ root, outside this
   # state, and are named <id>_* (also the Basic Ingest topics
@@ -69,6 +70,11 @@ locals {
     mqtt = "MQTT"
     http = "HTTP"
   }
+
+  # ACTUAL budget alerts to the kill switch, in percent of the limit. Each
+  # fires at most once a month, so the steps above 100 keep a backstop after
+  # a guard reset in a month that already crossed one.
+  guard_budget_steps = [100, 150, 200, 300, 500]
 }
 
 # ---------------------------------------------------------------------------
@@ -323,9 +329,25 @@ resource "aws_sns_topic_subscription" "kill_switch" {
 }
 
 # ---------------------------------------------------------------------------
-# Alarms. Measured baseline (Nov 2026, 2 devices): at most 48 publishes and 4
-# connects per 5 minutes. Missing data (an idle fleet) is not a breach.
+# Alarms. Measured baseline (Nov 2026, 2 devices): at most 48 publishes, 6
+# rule executions and 4 connects per 5 minutes. Missing data (an idle fleet)
+# is not a breach.
 # ---------------------------------------------------------------------------
+#
+# The publish alarms count what a device certificate can make AWS bill per
+# message: broker publishes (PublishIn.Success, MQTT and HTTPS) and rule
+# executions (RulesExecuted, account-wide). Basic Ingest
+# ($aws/rules/<product>_*) skips the broker, so PublishIn misses it; every
+# Basic Ingest message that reaches a rule counts in RulesExecuted. A rule
+# triggered by an ordinary publish counts twice, which only lowers the bar.
+#
+# RuleNotFound (Basic Ingest to a rule that does not exist or is disabled) is
+# deliberately left out. Such a message is billed neither as messaging nor as
+# a rule (no rule runs), so it costs nothing to absorb; AWS throttles it
+# (RuleExecutionThrottled); and RuleNotFound is reported per RuleName, a name
+# the sender picks, so an account-wide sum needs a Metrics Insights alarm,
+# which is outside the free tier and billed per metric it analyses: a sender
+# inventing rule names would run up the alarm's own bill.
 resource "aws_cloudwatch_metric_alarm" "publish" {
   for_each = {
     "${local.guard_prefix}-publish-5m"  = 1 # one breaching 5-minute period: traffic scope
@@ -333,7 +355,7 @@ resource "aws_cloudwatch_metric_alarm" "publish" {
   }
 
   alarm_name          = each.key
-  alarm_description   = "IoT publishes (MQTT + HTTPS) above ${var.guard_publish_per_5min} per 5 min for ${each.value * 5} min. Kill-switch scope: ${local.guard_alarm_scopes[each.key]}."
+  alarm_description   = "IoT publishes (MQTT + HTTPS) plus rule executions (Basic Ingest included) above ${var.guard_publish_per_5min} per 5 min for ${each.value * 5} min. Kill-switch scope: ${local.guard_alarm_scopes[each.key]}."
   comparison_operator = "GreaterThanThreshold"
   threshold           = var.guard_publish_per_5min
   evaluation_periods  = each.value
@@ -344,9 +366,19 @@ resource "aws_cloudwatch_metric_alarm" "publish" {
 
   metric_query {
     id          = "total"
-    expression  = "FILL(mqtt, 0) + FILL(http, 0)"
-    label       = "PublishIn.Success, all protocols"
+    expression  = "FILL(mqtt, 0) + FILL(http, 0) + FILL(rules, 0)"
+    label       = "PublishIn.Success, all protocols, plus RulesExecuted"
     return_data = true
+  }
+
+  metric_query {
+    id = "rules"
+    metric {
+      namespace   = "AWS/IoT"
+      metric_name = "RulesExecuted"
+      period      = 300
+      stat        = "Sum"
+    }
   }
 
   dynamic "metric_query" {
@@ -432,9 +464,10 @@ resource "aws_budgets_budget" "guard" {
   time_unit    = "MONTHLY"
 
   # Over the limit: the kill switch (and the topic's email). ACTUAL alerts fire
-  # once per month each, so 150 % re-arms the kill switch after a reset.
+  # once per month each, so the higher steps re-arm the kill switch after a
+  # reset. A budget takes 10 notifications; this one uses at most 7.
   dynamic "notification" {
-    for_each = toset([100, 150])
+    for_each = toset(local.guard_budget_steps)
     content {
       comparison_operator       = "GREATER_THAN"
       threshold                 = notification.value

@@ -32,10 +32,28 @@ export interface Presence {
 }
 
 /**
+ * How far apart a connect and a disconnect may be for the session number
+ * (versionNumber) to order them. AWS IoT restarts it after a client id has
+ * been disconnected for about an hour, so beyond this only timestamps count.
+ * The same as the OTA controller's sessionWindow.
+ */
+export const SESSION_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * connectedLast tells whether a connect is newer than a disconnect: by
+ * session when the two are close together and the sessions differ (a
+ * replaced session's disconnect can come a moment after the new connect),
+ * otherwise by timestamp, a tie counting as online. The OTA controller's
+ * connectedLast.
+ */
+export function connectedLast(c: { at: number; session: number }, d: { at: number; session: number }): boolean {
+  if (Math.abs(c.at - d.at) <= SESSION_WINDOW_MS && c.session !== d.session) return c.session > d.session;
+  return c.at >= d.at;
+}
+
+/**
  * presence turns the presence table (two items per thing: its latest
- * connected and disconnected events) into online state. The session
- * number orders the two, since a disconnect of an old session can arrive
- * after the next connect; the same rule as the OTA controller.
+ * connected and disconnected events) into online state (connectedLast).
  */
 export function presence(items: Record<string, Plain>[]): Map<string, Presence> {
   const byThing = new Map<string, { c?: Record<string, Plain>; d?: Record<string, Plain> }>();
@@ -48,12 +66,11 @@ export function presence(items: Record<string, Plain>[]): Map<string, Presence> 
     byThing.set(thing, e);
   }
   const out = new Map<string, Presence>();
+  const num = (x: Plain | undefined) => (typeof x === "number" ? x : undefined);
+  const ev = (x: Record<string, Plain>) => ({ at: num(x.at) ?? 0, session: num(x.session) ?? 0 });
   for (const [thing, { c, d }] of byThing) {
-    const num = (x: Plain | undefined) => (typeof x === "number" ? x : undefined);
-    const cs = num(c?.session) ?? -1;
-    const ds = num(d?.session) ?? -1;
     out.set(thing, {
-      online: c !== undefined && (d === undefined || cs > ds || (cs === ds && (num(c.at) ?? 0) > (num(d.at) ?? 0))),
+      online: c !== undefined && (d === undefined || connectedLast(ev(c), ev(d))),
       lastConnected: num(c?.at),
       lastDisconnected: num(d?.at),
     });

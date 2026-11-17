@@ -30,7 +30,7 @@ const status = (over: Partial<ProductStatus> = {}): ProductStatus => ({
 });
 
 describe("presence", () => {
-  it("orders by session, then time, like the controller", () => {
+  it("orders events close together by session, like the controller", () => {
     const p = presence([
       { thing: "A", event: "connected", at: 2000, session: 7 },
       { thing: "A", event: "disconnected", at: 3000, session: 6 }, // late disconnect of an older session
@@ -42,6 +42,24 @@ describe("presence", () => {
     expect(p.get("B")?.online).toBe(false);
     expect(p.get("C")?.online).toBe(false);
     expect(p.get("A")?.lastDisconnected).toBe(3000);
+  });
+
+  it("orders by time once AWS restarted the session number (over an hour offline)", () => {
+    const h = 3600 * 1000;
+    const p = presence([
+      // Back: the reconnect after 2 h has session 0, lower than the disconnect's.
+      { thing: "BACK", event: "disconnected", at: 1000, session: 9 },
+      { thing: "BACK", event: "connected", at: 1000 + 2 * h, session: 0 },
+      // Gone again within the new session.
+      { thing: "GONE", event: "connected", at: 1000 + 2 * h, session: 0 },
+      { thing: "GONE", event: "disconnected", at: 1000 + 3 * h, session: 0 },
+      // An old high-session connect, a much later restarted-session disconnect.
+      { thing: "STALE", event: "connected", at: 1000, session: 12 },
+      { thing: "STALE", event: "disconnected", at: 1000 + 5 * h, session: 1 },
+    ]);
+    expect(p.get("BACK")?.online).toBe(true);
+    expect(p.get("GONE")?.online).toBe(false);
+    expect(p.get("STALE")?.online).toBe(false);
   });
 });
 
