@@ -1,4 +1,3 @@
 {
-  "e8770fc5d9306d2d356c26191a1bedf386560478": "iot-device-sdk#9: full releases, not marked Latest. Products pinned it until iot-platform#31; remove it once none does.",
-  "399a615b08520b6edc4f1e07aaee742cc7ff5de2": "iot-device-sdk (iot-platform#31): FIRMWARE_SIGNING_KEY is a declared workflow_call secret, passed by name."
+  "399a615b08520b6edc4f1e07aaee742cc7ff5de2": "iot-device-sdk#15 (iot-platform#31): FIRMWARE_SIGNING_KEY is a declared workflow_call secret, passed by name."
 }
