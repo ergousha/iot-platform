@@ -149,7 +149,7 @@ To **re-enrol** a device (a new key, erased NVS), use `ergo commission --reprovi
 
 ## 3. Firmware Release & OTA Flow
 
-Releases are fully automated. A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub release (not marked Latest; its GitHub status does not affect the rollout) and an upload to S3. The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
+Releases are fully automated. A merge to a product's `main` runs the SDK's reusable [`firmware-release.yml`](https://github.com/ergousha/iot-device-sdk/blob/main/.github/workflows/firmware-release.yml): next semver from the conventional commits, a build with no secrets and no AWS, a signed manifest, a GitHub release and an upload to S3, after which the release is marked Latest (its GitHub status does not affect the rollout). The **OTA controller** Lambda ([ota_controller.tf](ota_controller.tf), [lambda/ota_controller](lambda/ota_controller)) takes it from there: canary, soak gate, fleet, halts and emails. Nobody clicks anything unless something goes wrong.
 
 ### What a release uploads
 

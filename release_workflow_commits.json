@@ -1,3 +1,4 @@
 {
-  "399a615b08520b6edc4f1e07aaee742cc7ff5de2": "iot-device-sdk#15 (iot-platform#31): FIRMWARE_SIGNING_KEY is a declared workflow_call secret, passed by name."
+  "399a615b08520b6edc4f1e07aaee742cc7ff5de2": "iot-device-sdk#15 (iot-platform#31): FIRMWARE_SIGNING_KEY is a declared workflow_call secret, passed by name.",
+  "7b3311b128e827aca7093c7e592637f5a15adb80": "iot-device-sdk#17: the release is marked Latest once it is on S3."
 }
